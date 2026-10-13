@@ -99,8 +99,10 @@ HammerDB:
                                binary logging on and log_bin_trust_function_creators off)
 
 Schema / output:
-      --skip-prepare           assume both data sets already exist
-      --prepare-only           build/load the data sets, run no benchmark
+      --skip-prepare           reuse the existing data sets and never rebuild
+                               them (by default every schema is dropped and
+                               reloaded before each measured run)
+      --prepare-only           build/load the data sets once, run no benchmark
       --cleanup-after          drop both data sets when finished
   -o, --outdir DIR             results root (default $OUT_ROOT)
   -l, --label TEXT             label appended to the results directory name
@@ -304,7 +306,8 @@ duration_min      $DURATION_MIN
 sysbench_schema   $SB_DB, $SB_TABLES tables x $SB_TABLE_SIZE rows
 hammerdb_schema   $HDB_DB, $HDB_WAREHOUSES warehouses, allwarehouse=$HDB_ALLWAREHOUSE
 configurations    $total_cfg
-estimated_runtime ${total_min} min (~$(( total_min / 60 ))h, excluding schema builds)
+schema_rebuild    $( (( SKIP_PREPARE )) && echo "off (--skip-prepare)" || echo "dropped and reloaded before every measured run" )
+estimated_runtime ${total_min} min (~$(( total_min / 60 ))h, excluding $( (( SKIP_PREPARE )) && echo 0 || echo $total_cfg ) schema rebuilds)
 EOF
 cat "$OUT/${PFX}_config.txt"
 
@@ -441,15 +444,31 @@ if [[ $HDB_NO_STORED_PROCS == auto ]]; then HDB_NO_STORED_PROCS="false"; fi
 SB_CSV="$OUT/${PFX}_sysbench_results.csv"
 sb_common=(--config-file="$SB_CNF" --tables="$SB_TABLES" --table-size="$SB_TABLE_SIZE")
 
+# Drops the sysbench data set. DROP DATABASE is the cheapest and the most
+# thorough way, but not every managed service grants it, so fall back to the
+# tool's own cleanup (which only knows about the current --tables).
+# $1 = tag used in the log file name
+sysbench_drop() {
+    local tag=$1
+    if (( DRY_RUN )); then return 0; fi
+    if mysql_q "DROP DATABASE IF EXISTS \`$SB_DB\`" 2>>"$OUT/server/${PFX}_errors.log"; then return 0; fi
+    log "WARN: cannot drop database $SB_DB - falling back to 'sysbench cleanup'"
+    sysbench "${sb_common[@]}" oltp_read_write cleanup \
+        >>"$OUT/sysbench/${PFX}_cleanup_$tag.log" 2>&1 || true
+}
+
+# Rebuilds the data set from scratch; $1 = tag used in the log file name.
 sysbench_prepare() {
-    hdr "SYSBENCH PREPARE ($SB_TABLES x $SB_TABLE_SIZE rows)"
+    local tag=$1
+    hdr "SYSBENCH PREPARE $tag ($SB_TABLES x $SB_TABLE_SIZE rows)"
     local cmd=(sysbench "${sb_common[@]}" --threads="$SB_PREPARE_THREADS" oltp_read_write prepare)
-    log "sysbench oltp_read_write prepare (threads=$SB_PREPARE_THREADS)"
+    log "dropping $SB_DB and running sysbench oltp_read_write prepare (threads=$SB_PREPARE_THREADS)"
     if (( DRY_RUN )); then printf '  %s\n' "${cmd[*]}" | sed 's/--config-file=[^ ]*/--config-file=<creds>/'; return 0; fi
+    sysbench_drop "$tag"
     mysql_q "CREATE DATABASE IF NOT EXISTS \`$SB_DB\`" \
         || log "WARN: could not create $SB_DB - assuming it exists"
-    "${cmd[@]}" >"$OUT/sysbench/${PFX}_prepare.log" 2>&1 \
-        || { tail -20 "$OUT/sysbench/${PFX}_prepare.log"; die "sysbench prepare failed"; }
+    "${cmd[@]}" >"$OUT/sysbench/${PFX}_prepare_$tag.log" 2>&1 \
+        || { tail -20 "$OUT/sysbench/${PFX}_prepare_$tag.log"; die "sysbench prepare failed"; }
     log "prepare done ($(mysql_q "SELECT ROUND(SUM(data_length+index_length)/1024/1024/1024,2) FROM information_schema.tables WHERE table_schema='$SB_DB'" 2>/dev/null || echo '?') GB)"
 }
 
@@ -496,8 +515,7 @@ sysbench_parse() {
 
 sysbench_cleanup() {
     log "sysbench cleanup"
-    if (( DRY_RUN )); then return 0; fi
-    sysbench "${sb_common[@]}" oltp_read_write cleanup >>"$OUT/sysbench/${PFX}_cleanup.log" 2>&1 || true
+    sysbench_drop final
 }
 
 # ------------------------------------------------------------- HammerDB ------
@@ -541,8 +559,23 @@ hdb_save_tmp_logs() {
     done
 }
 
+# Drops the TPC-C schema; $1 = tag used in the log file name. 'deleteschema' is
+# only the fallback - DROP DATABASE is faster and also copes with a schema that
+# a failed build left half-finished.
+hammerdb_drop() {
+    local tag=$1
+    if (( DRY_RUN )); then return 0; fi
+    if mysql_q "DROP DATABASE IF EXISTS \`$HDB_DB\`" 2>>"$OUT/server/${PFX}_errors.log"; then return 0; fi
+    log "WARN: cannot drop database $HDB_DB - falling back to HammerDB deleteschema"
+    local tcl="$TMPSEC/drop.tcl"
+    { hdb_conn_block; echo "deleteschema"; } >"$tcl"
+    hdb_cli "$tcl" "$OUT/hammerdb/${PFX}_deleteschema_$tag.log" || true
+}
+
+# Rebuilds the TPC-C schema from scratch; $1 = tag used in the file names.
 hammerdb_build() {
-    hdr "HAMMERDB SCHEMA BUILD ($HDB_WAREHOUSES warehouses)"
+    local tag=$1
+    hdr "HAMMERDB SCHEMA BUILD $tag ($HDB_WAREHOUSES warehouses)"
     local tcl="$TMPSEC/build.tcl"
     {
         hdb_conn_block
@@ -556,14 +589,16 @@ diset tpcc mysql_history_pk true
 buildschema
 EOF
     } >"$tcl"
-    sed "s/^diset tpcc mysql_pass .*/diset tpcc mysql_pass <redacted>/" "$tcl" >"$OUT/hammerdb/${PFX}_build.tcl"
-    log "building TPC-C schema with $HDB_BUILD_VU virtual users (no_stored_procs=$HDB_NO_STORED_PROCS)"
+    sed "s/^diset tpcc mysql_pass .*/diset tpcc mysql_pass <redacted>/" "$tcl" >"$OUT/hammerdb/${PFX}_build_$tag.tcl"
+    log "dropping $HDB_DB and building the TPC-C schema with $HDB_BUILD_VU virtual users (no_stored_procs=$HDB_NO_STORED_PROCS)"
     if (( DRY_RUN )); then sed 's/mysql_pass .*/mysql_pass <redacted>/' "$tcl"; return 0; fi
-    hdb_cli "$tcl" "$OUT/hammerdb/${PFX}_build.log" \
-        || { hdb_save_tmp_logs build; tail -30 "$OUT/hammerdb/${PFX}_build.log"; die "HammerDB schema build failed"; }
-    hdb_save_tmp_logs build
-    grep -qi "SCHEMA COMPLETE\|Schema Complete" "$OUT/hammerdb/${PFX}_build.log" \
-        || log "WARN: 'schema complete' not found in build.log - check it before trusting results"
+    hammerdb_drop "$tag"
+    local log_file="$OUT/hammerdb/${PFX}_build_$tag.log"
+    hdb_cli "$tcl" "$log_file" \
+        || { hdb_save_tmp_logs "build_$tag"; tail -30 "$log_file"; die "HammerDB schema build failed"; }
+    hdb_save_tmp_logs "build_$tag"
+    grep -qi "SCHEMA COMPLETE\|Schema Complete" "$log_file" \
+        || log "WARN: 'schema complete' not found in ${log_file##*/} - check it before trusting results"
     log "schema build done"
 }
 
@@ -634,24 +669,20 @@ hammerdb_parse() {
 
 hammerdb_cleanup() {
     log "HammerDB schema drop"
-    if (( DRY_RUN )); then return 0; fi
-    local tcl="$TMPSEC/drop.tcl"
-    { hdb_conn_block; echo "deleteschema"; } >"$tcl"
-    hdb_cli "$tcl" "$OUT/hammerdb/${PFX}_deleteschema.log" || true
+    hammerdb_drop final
 }
 
 # ------------------------------------------------------------------ main -----
-if (( ! SKIP_PREPARE )); then
-    if (( RUN_SYSBENCH )); then sysbench_prepare; fi
-    if (( RUN_HAMMERDB )); then hammerdb_build; fi
-    if (( ! DRY_RUN )); then collect_server_info; fi
-else
-    log "--skip-prepare: using existing $SB_DB / $HDB_DB data sets"
-fi
-
 if (( PREPARE_ONLY )); then
+    if (( RUN_SYSBENCH )); then sysbench_prepare initial; fi
+    if (( RUN_HAMMERDB )); then hammerdb_build initial; fi
+    if (( ! DRY_RUN )); then collect_server_info; fi
     log "--prepare-only: data sets are ready, exiting"
     exit 0
+fi
+
+if (( SKIP_PREPARE )); then
+    log "--skip-prepare: reusing the existing $SB_DB / $HDB_DB data sets, no rebuild between runs"
 fi
 
 if (( RUN_SYSBENCH )); then
@@ -664,16 +695,25 @@ if (( RUN_HAMMERDB )); then
 fi
 
 # Runs form the outer loop so that an aborted session still holds at least one
-# complete pass over the whole thread matrix.
+# complete pass over the whole thread matrix. Every measured run starts from a
+# freshly loaded data set, so writes from the previous run cannot carry over.
+first_build=1
 for run in $(seq 1 "$RUNS"); do
     for thr in "${THREADS[@]}"; do
         if (( RUN_SYSBENCH )); then
+            if (( ! SKIP_PREPARE )); then sysbench_prepare "run${run}_t${thr}"; fi
             hdr "SYSBENCH run $run/$RUNS threads=$thr (${RAMPUP_MIN}m ramp + ${DURATION_MIN}m)"
             measure "sysbench_r${run}_t${thr}" sysbench_exec "$run" "$thr" || true
         fi
         if (( RUN_HAMMERDB )); then
+            if (( ! SKIP_PREPARE )); then hammerdb_build "run${run}_vu${thr}"; fi
             hdr "HAMMERDB TPC-C run $run/$RUNS vu=$thr (${RAMPUP_MIN}m ramp + ${DURATION_MIN}m)"
             measure "hammerdb_r${run}_vu${thr}" hammerdb_exec "$run" "$thr" || true
+        fi
+        # Schema sizes are the same for every rebuild, so record them once.
+        if (( first_build && ! SKIP_PREPARE && ! DRY_RUN )); then
+            collect_server_info
+            first_build=0
         fi
     done
 done

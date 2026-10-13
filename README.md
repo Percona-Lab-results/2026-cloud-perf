@@ -16,8 +16,14 @@ state around every run.
 | measured | 20 min | 20 min (`mysql_duration`) |
 | metric | tps / qps / latency incl. p95 | NOPM / TPM |
 
-Defaults: 3 runs of the matrix = 24 configurations ~ 10 h. Runs form the outer
-loop, so an interrupted session still contains complete passes over the matrix.
+Both schemas are dropped and reloaded before every measured run, so each run
+starts from an identical, freshly loaded data set and the writes of the previous
+run cannot carry over. `--skip-prepare` turns that off and reuses whatever is
+already there.
+
+Defaults: 3 runs of the matrix = 24 configurations ~ 10 h plus 24 schema
+rebuilds. Runs form the outer loop, so an interrupted session still contains
+complete passes over the matrix.
 
 ### Usage
 
@@ -35,8 +41,8 @@ loop, so an interrupted session still contains complete passes over the matrix.
 ```
 
 Useful flags: `--runs`, `--threads`, `--rampup`, `--duration`, `--benchmarks`,
-`--skip-prepare` (reuse existing data sets), `--prepare-only`,
-`--cleanup-after`, `--ssl`, `--sample-interval`.
+`--skip-prepare` (reuse the existing data sets, never rebuild),
+`--prepare-only`, `--cleanup-after`, `--ssl`, `--sample-interval`.
 
 Credentials are written to 0600 option files in a private temp directory and
 passed to `mysql`/`sysbench` via `--defaults-extra-file` / `--config-file`, so
@@ -58,8 +64,9 @@ results/<provider>-<UTC timestamp>-<label>/
   <provider>_sysbench_results.csv   provider,benchmark,run,threads,tps,qps,
                                     lat_min/avg/p95/max,errors
   <provider>_hammerdb_results.csv   provider,benchmark,run,vu,nopm,tpm,status
-  sysbench/                         full sysbench output per run (10s reports)
-  hammerdb/                         per-run tcl + hammerdbcli log, VU log, xtprof
+  sysbench/                         full sysbench output + prepare log per run
+  hammerdb/                         per-run tcl + hammerdbcli log, VU log,
+                                    xtprof, and the schema build log per run
   server/
     <provider>_variables_{baseline,final}.tsv
     <provider>_status_<phase>.tsv         SHOW GLOBAL STATUS before/after each run
@@ -77,7 +84,9 @@ awk 'FNR>1 || NR==1' results/*/*_sysbench_results.csv > all_sysbench.csv
 
 ### Notes for managed services
 
-* The benchmark user needs `CREATE` on both schemas; `PROCESS` is needed for
+* The benchmark user needs `CREATE` on both schemas and `DROP` for the rebuild
+  between runs; without `DROP DATABASE` the script falls back to
+  `sysbench cleanup` / HammerDB `deleteschema`. `PROCESS` is needed for
   `SHOW ENGINE INNODB STATUS` (the script warns and continues without it).
 * HammerDB creates stored procedures by default. With binary logging on and
   `log_bin_trust_function_creators=OFF` that fails without `SUPER`; in that case
