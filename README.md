@@ -3,27 +3,38 @@ Performance research of standard managed DB tiers in minor cloud providers
 
 ## cloud-mysql-perf.sh
 
-OLTP benchmark driver for a managed MySQL endpoint. Runs both benchmarks over a
-thread matrix, repeats the whole matrix N times, and collects the server-side
-state around every run.
+OLTP benchmark driver for a managed MySQL endpoint. Sweeps the thread matrix
+once per data-set size, repeats everything N times, and collects the
+server-side state around every run.
 
 | | sysbench | HammerDB |
 |---|---|---|
 | workload | `oltp_read_write` | TPC-C (TPROC-C) |
-| data set | 10 tables x 1,000,000 rows (~2.5 GB) | 25 warehouses (~2.5 GB) |
+| data sets | 10 tables x 10M / 20M / 40M rows per table | 160 / 320 / 640 warehouses |
 | load levels | 1, 2, 4, 8 threads | 1, 2, 4, 8 virtual users |
 | ramp-up | 5 min, discarded | 5 min (`mysql_rampup`) |
 | measured | 20 min | 20 min (`mysql_duration`) |
 | metric | tps / qps / latency incl. p95 | NOPM / TPM |
 
-Both schemas are dropped and reloaded before every measured run, so each run
-starts from an identical, freshly loaded data set and the writes of the previous
-run cannot carry over. `--skip-prepare` turns that off and reuses whatever is
-already there.
+The data-set size is the outer dimension of each sweep (`--table-size`,
+`--warehouses`; both accept a list, `K`/`M` suffixes allowed), so the point of
+the exercise - how a tier behaves as the data grows past its buffer pool - is
+one column of the CSVs.
 
-Defaults: 3 runs of the matrix = 24 configurations ~ 10 h plus 24 schema
-rebuilds. Runs form the outer loop, so an interrupted session still contains
-complete passes over the matrix.
+Loading granularity is `--rebuild`:
+
+| `--rebuild` | reload | rebuilds with the defaults |
+|---|---|---|
+| `run` (default) | before every measured run | 72 |
+| `dataset` | once per data set and run, then sweep the thread levels | 18 |
+| `never` (`--skip-prepare`) | reuse whatever is loaded | 0 |
+
+Defaults: 3 runs x 3 data sets x 4 load levels x 2 benchmarks = 72
+configurations ~ 30 h of measured time, and the default `--rebuild run` adds a
+full load of up to 400M rows / 640 warehouses before each of them. For a
+realistic schedule use `--rebuild dataset`, or cut `--runs` / `--threads`.
+Runs form the outer loop, so an interrupted session still contains complete
+passes over every data set.
 
 ### Usage
 
@@ -35,14 +46,15 @@ complete passes over the matrix.
     -H db.example.com -P 25060 -u doadmin -p 'secret' --label 2vcpu-4gb
 
 ./cloud-mysql-perf.sh --provider linode -H db.example.com -u admin \
-    --password-file ~/.pw --runs 1 -t "1 8" -b sysbench   # quick single pass
-./cloud-mysql-perf.sh --provider hetzner -H ... -n        # dry run, print plan
-./cloud-mysql-perf.sh --help                              # all options
+    --password-file ~/.pw --runs 1 -t "1 8" -b sysbench \
+    --table-size 10M --rebuild dataset            # one data set, one pass
+./cloud-mysql-perf.sh --provider hetzner -H ... -n # dry run, print the plan
+./cloud-mysql-perf.sh --help                       # all options
 ```
 
 Useful flags: `--runs`, `--threads`, `--rampup`, `--duration`, `--benchmarks`,
-`--skip-prepare` (reuse the existing data sets, never rebuild),
-`--prepare-only`, `--cleanup-after`, `--ssl`, `--sample-interval`.
+`--table-size`, `--warehouses`, `--rebuild`, `--prepare-only`,
+`--cleanup-after`, `--ssl`, `--sample-interval`, `--innodb-status`.
 
 Credentials are written to 0600 option files in a private temp directory and
 passed to `mysql`/`sysbench` via `--defaults-extra-file` / `--config-file`, so
@@ -59,11 +71,13 @@ dropped into one directory or concatenated without losing their origin.
 ```
 results/<provider>-<UTC timestamp>-<label>/
   <provider>_config.txt             provider, parameters, client versions, estimate
-  <provider>_summary.txt            per-thread-level means
+  <provider>_summary.txt            means per data set and load level
   <provider>_run.log
-  <provider>_sysbench_results.csv   provider,benchmark,run,threads,tps,qps,
+  <provider>_sysbench_results.csv   provider,benchmark,run,tables,
+                                    rows_per_table,threads,...,tps,qps,
                                     lat_min/avg/p95/max,errors
-  <provider>_hammerdb_results.csv   provider,benchmark,run,vu,nopm,tpm,status
+  <provider>_hammerdb_results.csv   provider,benchmark,run,warehouses,vu,
+                                    nopm,tpm,status
   sysbench/                         full sysbench output + prepare log per run
   hammerdb/                         per-run tcl + hammerdbcli log, VU log,
                                     xtprof, and the schema build log per run
@@ -72,9 +86,13 @@ results/<provider>-<UTC timestamp>-<label>/
     <provider>_status_<phase>.tsv         SHOW GLOBAL STATUS before/after each run
     <provider>_status_delta_<phase>.tsv   counters that moved during the run
     <provider>_samples_<phase>.tsv        key counters every --sample-interval sec
-    <provider>_innodb_status_<phase>.txt  SHOW ENGINE INNODB STATUS before/after
+    <provider>_innodb_status_<phase>.txt  only with --innodb-status
     <provider>_server_info.txt            version, buffer pool, isolation, sizes
+    <provider>_server_info_<dataset>.txt  on-disk size of each loaded data set
 ```
+
+Phase tags carry the data set, so every artifact is attributable:
+`sysbench_r2_s20M_t4`, `hammerdb_r2_w320_vu4`.
 
 Comparing providers is then just:
 
@@ -86,14 +104,22 @@ awk 'FNR>1 || NR==1' results/*/*_sysbench_results.csv > all_sysbench.csv
 
 * The benchmark user needs `CREATE` on both schemas and `DROP` for the rebuild
   between runs; without `DROP DATABASE` the script falls back to
-  `sysbench cleanup` / HammerDB `deleteschema`. `PROCESS` is needed for
-  `SHOW ENGINE INNODB STATUS` (the script warns and continues without it).
+  `sysbench cleanup` / HammerDB `deleteschema`.
+* `SHOW ENGINE INNODB STATUS` is not collected unless `--innodb-status` is
+  given - it needs `PROCESS`, which managed services often withhold (the script
+  warns and continues when it is denied).
 * HammerDB creates stored procedures by default. With binary logging on and
   `log_bin_trust_function_creators=OFF` that fails without `SUPER`; in that case
   build the schema with `--no-stored-procs yes`, or let the server decide with
   `--no-stored-procs auto`.
 * HammerDB connects over the unix socket whenever the host is
   `localhost`/`127.0.0.1` - use the routable address, or pass `--socket`.
+* Schema builds dominate the wall clock at these sizes. `--build-vu` (default
+  16, capped at the warehouse count) is what makes a 640-warehouse load
+  tolerable; raise it only as far as the tier's `max_connections` allows.
+* Check that the tier has the disk space for the largest data set before
+  starting - 10x40M sysbench rows is roughly 100 GB, 640 warehouses ~64 GB, and
+  both schemas exist side by side.
 * sysbench's measured window is produced with `--report-checkpoints`, which
   resets the counters at the end of the ramp-up; the connections are never
   dropped, so the 25 minutes are one continuous run.

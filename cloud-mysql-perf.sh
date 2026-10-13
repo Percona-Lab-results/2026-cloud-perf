@@ -2,16 +2,18 @@
 #
 # cloud-mysql-perf.sh - OLTP performance test harness for managed MySQL services.
 #
-#   sysbench  oltp_read_write : 10 tables x 1,000,000 rows  (~2.5 GB)
-#   HammerDB  TPC-C (TPROC-C) : 25 warehouses               (~2.5 GB)
+#   sysbench  oltp_read_write : 10 tables x 10M / 20M / 40M rows per table
+#   HammerDB  TPC-C (TPROC-C) : 160 / 320 / 640 warehouses
 #
+#   Data sets        : one measured sweep per size (--table-size, --warehouses)
 #   Thread/VU levels : 1 2 4 8      (--threads)
 #   Ramp-up          : 5 min        (--rampup)
 #   Measured run     : 20 min       (--duration)
 #   Runs             : 3            (--runs)
 #
-# Server-side state (global variables, global status before/during/after every
-# run, and SHOW ENGINE INNODB STATUS) is collected into the results directory.
+# Server-side state (global variables and global status before/during/after
+# every run) is collected into the results directory; SHOW ENGINE INNODB STATUS
+# is only captured with --innodb-status.
 #
 set -euo pipefail
 
@@ -33,22 +35,23 @@ DURATION_MIN=20
 BENCHMARKS="sysbench,hammerdb"
 
 SB_DB="sbtest"
-SB_TABLES=20
-SB_TABLE_SIZE=1000000
+SB_TABLES=10
+SB_TABLE_SIZE_LIST="10M 20M 40M"   # rows per table, one data set per value
 SB_PREPARE_THREADS=10
 
 HDB_HOME=${HAMMERDB_HOME:-/opt/HammerDB-6.0}
 HDB_DB="tpcc"
-HDB_WAREHOUSES=30
-HDB_BUILD_VU=5
+HDB_WAREHOUSE_LIST="160 320 640"   # one data set per value
+HDB_BUILD_VU=16
 HDB_ALLWAREHOUSE="true"
 HDB_NO_STORED_PROCS="false"  # auto | true | false
 
 OUT_ROOT="results"
 LABEL=""
 SAMPLE_INTERVAL=10
+COLLECT_INNODB=0
 USE_SSL=0
-SKIP_PREPARE=0
+REBUILD="run"                # run | dataset | never
 PREPARE_ONLY=0
 CLEANUP_AFTER=0
 DRY_RUN=0
@@ -83,14 +86,16 @@ Workload:
 
 sysbench:
       --sysbench-db NAME       database (default $SB_DB)
-      --tables N               tables (default $SB_TABLES)
-      --table-size N           rows per table (default $SB_TABLE_SIZE)
+      --tables N               tables per data set (default $SB_TABLES)
+      --table-size "LIST"      rows per table - one data set per value, K/M
+                               suffixes allowed (default "$SB_TABLE_SIZE_LIST")
       --prepare-threads N      threads used by 'sysbench prepare' (default $SB_PREPARE_THREADS)
 
 HammerDB:
       --hammerdb-home DIR      HammerDB install (default $HDB_HOME)
       --hammerdb-db NAME       database (default $HDB_DB)
-      --warehouses N           warehouses (default $HDB_WAREHOUSES)
+      --warehouses "LIST"      warehouses - one data set per value
+                               (default "$HDB_WAREHOUSE_LIST")
       --build-vu N             virtual users used to build the schema (default $HDB_BUILD_VU)
       --no-allwarehouse        each VU stays on its home warehouse
       --no-stored-procs yes|no|auto
@@ -99,14 +104,19 @@ HammerDB:
                                binary logging on and log_bin_trust_function_creators off)
 
 Schema / output:
-      --skip-prepare           reuse the existing data sets and never rebuild
-                               them (by default every schema is dropped and
-                               reloaded before each measured run)
-      --prepare-only           build/load the data sets once, run no benchmark
+      --rebuild WHEN           run     drop and reload before every measured
+                                       run (default)
+                               dataset reload once per data set and run, then
+                                       sweep the thread levels on it
+                               never   reuse whatever is already loaded
+      --skip-prepare           alias for --rebuild never
+      --prepare-only           load the first data set only, run no benchmark
       --cleanup-after          drop both data sets when finished
   -o, --outdir DIR             results root (default $OUT_ROOT)
   -l, --label TEXT             label appended to the results directory name
       --sample-interval SEC    SHOW GLOBAL STATUS sampling during runs, 0=off (default $SAMPLE_INTERVAL)
+      --innodb-status          also capture SHOW ENGINE INNODB STATUS before and
+                               after every run (off by default; needs PROCESS)
   -n, --dry-run                print what would run, touch nothing
   -y, --yes                    do not pause for the runtime estimate
   -h, --help                   this text
@@ -140,11 +150,11 @@ while [[ $# -gt 0 ]]; do
         -b|--benchmarks)      BENCHMARKS=$2; shift 2 ;;
         --sysbench-db)        SB_DB=$2; shift 2 ;;
         --tables)             SB_TABLES=$2; shift 2 ;;
-        --table-size)         SB_TABLE_SIZE=$2; shift 2 ;;
+        --table-size|--table-sizes) SB_TABLE_SIZE_LIST=$2; shift 2 ;;
         --prepare-threads)    SB_PREPARE_THREADS=$2; shift 2 ;;
         --hammerdb-home)      HDB_HOME=$2; shift 2 ;;
         --hammerdb-db)        HDB_DB=$2; shift 2 ;;
-        --warehouses)         HDB_WAREHOUSES=$2; shift 2 ;;
+        --warehouses)         HDB_WAREHOUSE_LIST=$2; shift 2 ;;
         --build-vu)           HDB_BUILD_VU=$2; shift 2 ;;
         --no-allwarehouse)    HDB_ALLWAREHOUSE="false"; shift ;;
         --no-stored-procs)
@@ -155,12 +165,20 @@ while [[ $# -gt 0 ]]; do
                 *) die "--no-stored-procs expects yes|no|auto" ;;
             esac
             shift 2 ;;
-        --skip-prepare)       SKIP_PREPARE=1; shift ;;
+        --rebuild)
+            case $2 in
+                run|dataset|never) REBUILD=$2 ;;
+                *) die "--rebuild expects run|dataset|never" ;;
+            esac
+            shift 2 ;;
+        --skip-prepare)       REBUILD="never"; shift ;;
         --prepare-only)       PREPARE_ONLY=1; shift ;;
         --cleanup-after)      CLEANUP_AFTER=1; shift ;;
         -o|--outdir)          OUT_ROOT=$2; shift 2 ;;
         -l|--label)           LABEL=$2; shift 2 ;;
         --sample-interval)    SAMPLE_INTERVAL=$2; shift 2 ;;
+        --innodb-status)      COLLECT_INNODB=1; shift ;;
+        --no-innodb-status)   COLLECT_INNODB=0; shift ;;
         -n|--dry-run)         DRY_RUN=1; shift ;;
         -y|--yes)             ASSUME_YES=1; shift ;;
         -h|--help)            usage; exit 0 ;;
@@ -190,6 +208,38 @@ for b in "${_benches[@]}"; do
     esac
 done
 (( RUN_SYSBENCH || RUN_HAMMERDB )) || die "no benchmark selected"
+
+# "40M" -> 40000000, "500k" -> 500000, "250" -> 250
+to_number() {
+    local v=${1//,/}
+    case $v in
+        *[Mm]) v=${v%[Mm]}; [[ $v =~ ^[0-9]+$ ]] || die "not a number: $1"; echo $(( v * 1000000 )) ;;
+        *[Kk]) v=${v%[Kk]}; [[ $v =~ ^[0-9]+$ ]] || die "not a number: $1"; echo $(( v * 1000 )) ;;
+        *) [[ $v =~ ^[0-9]+$ ]] || die "not a number: $1"; echo "$v" ;;
+    esac
+}
+
+# 40000000 -> 40M, 500000 -> 500K; used in file names and log lines.
+num_label() {
+    local n=$1
+    if (( n >= 1000000 && n % 1000000 == 0 )); then echo "$(( n / 1000000 ))M"
+    elif (( n >= 1000 && n % 1000 == 0 )); then echo "$(( n / 1000 ))K"
+    else echo "$n"; fi
+}
+
+# Data-set dimensions: one measured sweep of the thread matrix per value.
+SB_SIZES=()
+for v in ${SB_TABLE_SIZE_LIST//,/ }; do SB_SIZES+=("$(to_number "$v")"); done
+HDB_WAREHOUSES=()
+for v in ${HDB_WAREHOUSE_LIST//,/ }; do HDB_WAREHOUSES+=("$(to_number "$v")"); done
+if (( RUN_SYSBENCH )) && (( ${#SB_SIZES[@]} == 0 )); then die "--table-size is empty"; fi
+if (( RUN_HAMMERDB )) && (( ${#HDB_WAREHOUSES[@]} == 0 )); then die "--warehouses is empty"; fi
+
+if [[ $REBUILD == never ]]; then
+    if (( RUN_SYSBENCH && ${#SB_SIZES[@]} > 1 )) || (( RUN_HAMMERDB && ${#HDB_WAREHOUSES[@]} > 1 )); then
+        echo "$SCRIPT_NAME: WARN: --rebuild never with several data-set sizes - every sweep will run against whatever is loaded" >&2
+    fi
+fi
 
 RAMPUP_SEC=$(( RAMPUP_MIN * 60 ))
 DURATION_SEC=$(( DURATION_MIN * 60 ))
@@ -285,9 +335,17 @@ OUT=$(cd "$OUT" && pwd)
 
 # --------------------------------------------------------- runtime budget ----
 read -r -a THREADS <<<"${THREAD_LIST//,/ }"
-n_bench=$(( RUN_SYSBENCH + RUN_HAMMERDB ))
-total_cfg=$(( RUNS * n_bench * ${#THREADS[@]} ))
+sb_cfg=$(( RUN_SYSBENCH * RUNS * ${#SB_SIZES[@]} * ${#THREADS[@]} ))
+hdb_cfg=$(( RUN_HAMMERDB * RUNS * ${#HDB_WAREHOUSES[@]} * ${#THREADS[@]} ))
+total_cfg=$(( sb_cfg + hdb_cfg ))
 total_min=$(( total_cfg * (RAMPUP_MIN + DURATION_MIN) ))
+
+case $REBUILD in
+    run)     rebuilds=$total_cfg; rebuild_txt="dropped and reloaded before every measured run" ;;
+    dataset) rebuilds=$(( RUNS * (RUN_SYSBENCH * ${#SB_SIZES[@]} + RUN_HAMMERDB * ${#HDB_WAREHOUSES[@]}) ))
+             rebuild_txt="dropped and reloaded once per data set and run" ;;
+    never)   rebuilds=0; rebuild_txt="off (--rebuild never) - existing data sets are reused" ;;
+esac
 
 cat >"$OUT/${PFX}_config.txt" <<EOF
 provider          $PROVIDER
@@ -303,11 +361,13 @@ runs              $RUNS
 threads           $THREAD_LIST
 rampup_min        $RAMPUP_MIN
 duration_min      $DURATION_MIN
-sysbench_schema   $SB_DB, $SB_TABLES tables x $SB_TABLE_SIZE rows
-hammerdb_schema   $HDB_DB, $HDB_WAREHOUSES warehouses, allwarehouse=$HDB_ALLWAREHOUSE
-configurations    $total_cfg
-schema_rebuild    $( (( SKIP_PREPARE )) && echo "off (--skip-prepare)" || echo "dropped and reloaded before every measured run" )
-estimated_runtime ${total_min} min (~$(( total_min / 60 ))h, excluding $( (( SKIP_PREPARE )) && echo 0 || echo $total_cfg ) schema rebuilds)
+sysbench_schema   $SB_DB, $SB_TABLES tables x {${SB_SIZES[*]}} rows per table
+hammerdb_schema   $HDB_DB, {${HDB_WAREHOUSES[*]}} warehouses, allwarehouse=$HDB_ALLWAREHOUSE
+configurations    $total_cfg (sysbench $sb_cfg, hammerdb $hdb_cfg)
+schema_rebuild    $rebuild_txt
+status_sampling   $( (( SAMPLE_INTERVAL > 0 )) && echo "every ${SAMPLE_INTERVAL}s" || echo off )
+innodb_status     $( (( COLLECT_INNODB )) && echo "before/after every run" || echo "off (--innodb-status to enable)" )
+estimated_runtime ${total_min} min (~$(( total_min / 60 ))h, excluding $rebuilds schema rebuilds)
 EOF
 cat "$OUT/${PFX}_config.txt"
 
@@ -328,14 +388,19 @@ collect_variables() {
     mysql_q 'SHOW GLOBAL VARIABLES' >"$OUT/server/${PFX}_variables_$tag.tsv" 2>>"$OUT/server/${PFX}_errors.log" || true
 }
 
+# Off by default: it needs PROCESS, which managed services often withhold, and
+# the dumps are large. Enable with --innodb-status.
 collect_innodb() {
     local tag=$1
+    (( COLLECT_INNODB )) || return 0
     mysql --defaults-extra-file="$MY_CNF" -e 'SHOW ENGINE INNODB STATUS\G' \
         >"$OUT/server/${PFX}_innodb_status_$tag.txt" 2>>"$OUT/server/${PFX}_errors.log" || \
         log "WARN: SHOW ENGINE INNODB STATUS failed for $tag (PROCESS privilege?)"
 }
 
+# $1 = optional tag, so the loaded size of every data set can be recorded
 collect_server_info() {
+    local tag=${1:-}
     {
         echo "-- version"
         mysql_qv 'SELECT VERSION() AS version, @@version_comment AS comment, @@hostname AS hostname'
@@ -355,7 +420,7 @@ collect_server_info() {
                   FROM information_schema.tables
                   WHERE table_schema IN ('$SB_DB','$HDB_DB')
                   GROUP BY table_schema"
-    } >"$OUT/server/${PFX}_server_info.txt" 2>>"$OUT/server/${PFX}_errors.log" || true
+    } >"$OUT/server/${PFX}_server_info${tag:+_$tag}.txt" 2>>"$OUT/server/${PFX}_errors.log" || true
 }
 
 # before-file after-file -> delta of every numeric counter that moved
@@ -442,29 +507,30 @@ if [[ $HDB_NO_STORED_PROCS == auto ]]; then HDB_NO_STORED_PROCS="false"; fi
 
 # ------------------------------------------------------------- sysbench ------
 SB_CSV="$OUT/${PFX}_sysbench_results.csv"
-sb_common=(--config-file="$SB_CNF" --tables="$SB_TABLES" --table-size="$SB_TABLE_SIZE")
+# --table-size varies per data set, so it is added by each function.
+sb_common=(--config-file="$SB_CNF" --tables="$SB_TABLES")
 
 # Drops the sysbench data set. DROP DATABASE is the cheapest and the most
 # thorough way, but not every managed service grants it, so fall back to the
 # tool's own cleanup (which only knows about the current --tables).
-# $1 = tag used in the log file name
+# $1 = rows per table, $2 = tag used in the log file name
 sysbench_drop() {
-    local tag=$1
+    local rows=$1 tag=$2
     if (( DRY_RUN )); then return 0; fi
     if mysql_q "DROP DATABASE IF EXISTS \`$SB_DB\`" 2>>"$OUT/server/${PFX}_errors.log"; then return 0; fi
     log "WARN: cannot drop database $SB_DB - falling back to 'sysbench cleanup'"
-    sysbench "${sb_common[@]}" oltp_read_write cleanup \
+    sysbench "${sb_common[@]}" --table-size="$rows" oltp_read_write cleanup \
         >>"$OUT/sysbench/${PFX}_cleanup_$tag.log" 2>&1 || true
 }
 
-# Rebuilds the data set from scratch; $1 = tag used in the log file name.
+# Rebuilds the data set from scratch; $1 = rows per table, $2 = file name tag.
 sysbench_prepare() {
-    local tag=$1
-    hdr "SYSBENCH PREPARE $tag ($SB_TABLES x $SB_TABLE_SIZE rows)"
-    local cmd=(sysbench "${sb_common[@]}" --threads="$SB_PREPARE_THREADS" oltp_read_write prepare)
-    log "dropping $SB_DB and running sysbench oltp_read_write prepare (threads=$SB_PREPARE_THREADS)"
+    local rows=$1 tag=$2
+    hdr "SYSBENCH PREPARE $tag ($SB_TABLES tables x $rows rows)"
+    local cmd=(sysbench "${sb_common[@]}" --table-size="$rows" --threads="$SB_PREPARE_THREADS" oltp_read_write prepare)
+    log "dropping $SB_DB and running sysbench oltp_read_write prepare ($SB_TABLES x $rows rows, threads=$SB_PREPARE_THREADS)"
     if (( DRY_RUN )); then printf '  %s\n' "${cmd[*]}" | sed 's/--config-file=[^ ]*/--config-file=<creds>/'; return 0; fi
-    sysbench_drop "$tag"
+    sysbench_drop "$rows" "$tag"
     mysql_q "CREATE DATABASE IF NOT EXISTS \`$SB_DB\`" \
         || log "WARN: could not create $SB_DB - assuming it exists"
     "${cmd[@]}" >"$OUT/sysbench/${PFX}_prepare_$tag.log" 2>&1 \
@@ -472,14 +538,15 @@ sysbench_prepare() {
     log "prepare done ($(mysql_q "SELECT ROUND(SUM(data_length+index_length)/1024/1024/1024,2) FROM information_schema.tables WHERE table_schema='$SB_DB'" 2>/dev/null || echo '?') GB)"
 }
 
-# $1 = run number, $2 = threads
+# $1 = run number, $2 = rows per table, $3 = threads
 sysbench_exec() {
-    local run=$1 thr=$2
-    local out="$OUT/sysbench/${PFX}_run${run}_t${thr}.log"
+    local run=$1 rows=$2 thr=$3
+    local out="$OUT/sysbench/${PFX}_run${run}_s$(num_label "$rows")_t${thr}.log"
     # One continuous sysbench run: --report-checkpoints resets all counters at
     # the end of the ramp-up, so the final report covers the measured window
     # only, without dropping and re-establishing connections.
     local cmd=(sysbench "${sb_common[@]}"
+        --table-size="$rows"
         --threads="$thr"
         --time=$(( RAMPUP_SEC + DURATION_SEC ))
         --report-interval=10
@@ -489,14 +556,14 @@ sysbench_exec() {
     if (( RAMPUP_SEC > 0 )); then cmd+=(--report-checkpoints="$RAMPUP_SEC"); fi
     cmd+=(oltp_read_write run)
     if (( DRY_RUN )); then printf '  %s\n' "${cmd[*]}" | sed 's/--config-file=[^ ]*/--config-file=<creds>/'; return 0; fi
-    "${cmd[@]}" >"$out" 2>&1 || log "WARN: sysbench run $run t=$thr exited non-zero"
-    sysbench_parse "$run" "$thr" "$out" >>"$SB_CSV"
+    "${cmd[@]}" >"$out" 2>&1 || log "WARN: sysbench run $run rows=$rows t=$thr exited non-zero"
+    sysbench_parse "$run" "$rows" "$thr" "$out" >>"$SB_CSV"
 }
 
 # Takes the LAST statistics block of the log, i.e. the post-ramp-up report.
 sysbench_parse() {
-    local run=$1 thr=$2 file=$3
-    awk -v provider="$PROVIDER" -v run="$run" -v thr="$thr" '
+    local run=$1 rows=$2 thr=$3 file=$4
+    awk -v provider="$PROVIDER" -v run="$run" -v tables="$SB_TABLES" -v rows="$rows" -v thr="$thr" '
         /^SQL statistics:/            { inblock=1 }
         inblock && /^ *transactions:/ { gsub(/[()]/,""); tps=$3; txn=$2 }
         inblock && /^ *queries:/      { gsub(/[()]/,""); qps=$3; qry=$2 }
@@ -507,15 +574,16 @@ sysbench_parse() {
         /^ *max:/                     { lmax=$2 }
         /percentile:/                 { p95=$3 }
         END {
-            printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
-                   provider, "sysbench", run, thr, ttime, txn, tps, qry, qps,
+            printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
+                   provider, "sysbench", run, tables, rows, thr,
+                   ttime, txn, tps, qry, qps,
                    lmin, lavg, p95, lmax, (errs==""?0:errs)
         }' "$file"
 }
 
 sysbench_cleanup() {
     log "sysbench cleanup"
-    sysbench_drop final
+    sysbench_drop "${SB_SIZES[0]}" final
 }
 
 # ------------------------------------------------------------- HammerDB ------
@@ -572,16 +640,17 @@ hammerdb_drop() {
     hdb_cli "$tcl" "$OUT/hammerdb/${PFX}_deleteschema_$tag.log" || true
 }
 
-# Rebuilds the TPC-C schema from scratch; $1 = tag used in the file names.
+# Rebuilds the TPC-C schema from scratch; $1 = warehouses, $2 = file name tag.
 hammerdb_build() {
-    local tag=$1
-    hdr "HAMMERDB SCHEMA BUILD $tag ($HDB_WAREHOUSES warehouses)"
+    local wh=$1 tag=$2
+    hdr "HAMMERDB SCHEMA BUILD $tag ($wh warehouses)"
     local tcl="$TMPSEC/build.tcl"
+    local build_vu=$(( HDB_BUILD_VU < wh ? HDB_BUILD_VU : wh ))
     {
         hdb_conn_block
         cat <<EOF
-diset tpcc mysql_count_ware $HDB_WAREHOUSES
-diset tpcc mysql_num_vu $HDB_BUILD_VU
+diset tpcc mysql_count_ware $wh
+diset tpcc mysql_num_vu $build_vu
 diset tpcc mysql_storage_engine innodb
 diset tpcc mysql_partition false
 diset tpcc mysql_no_stored_procs $HDB_NO_STORED_PROCS
@@ -590,7 +659,7 @@ buildschema
 EOF
     } >"$tcl"
     sed "s/^diset tpcc mysql_pass .*/diset tpcc mysql_pass <redacted>/" "$tcl" >"$OUT/hammerdb/${PFX}_build_$tag.tcl"
-    log "dropping $HDB_DB and building the TPC-C schema with $HDB_BUILD_VU virtual users (no_stored_procs=$HDB_NO_STORED_PROCS)"
+    log "dropping $HDB_DB and building $wh warehouses with $build_vu virtual users (no_stored_procs=$HDB_NO_STORED_PROCS)"
     if (( DRY_RUN )); then sed 's/mysql_pass .*/mysql_pass <redacted>/' "$tcl"; return 0; fi
     hammerdb_drop "$tag"
     local log_file="$OUT/hammerdb/${PFX}_build_$tag.log"
@@ -602,14 +671,16 @@ EOF
     log "schema build done"
 }
 
-# $1 = run number, $2 = virtual users
+# $1 = run number, $2 = warehouses, $3 = virtual users
 hammerdb_exec() {
-    local run=$1 vu=$2
-    local tcl="$TMPSEC/run${run}_vu${vu}.tcl"
-    local log="$OUT/hammerdb/${PFX}_run${run}_vu${vu}.log"
+    local run=$1 wh=$2 vu=$3
+    local name="run${run}_w${wh}_vu${vu}"
+    local tcl="$TMPSEC/$name.tcl"
+    local log="$OUT/hammerdb/${PFX}_$name.log"
     {
         hdb_conn_block
         cat <<EOF
+diset tpcc mysql_count_ware $wh
 diset tpcc mysql_driver timed
 diset tpcc mysql_rampup $RAMPUP_MIN
 diset tpcc mysql_duration $DURATION_MIN
@@ -641,17 +712,17 @@ if { [ catch {
 } err ] } { puts "RESULT EXTRACTION FAILED: \$err" }
 EOF
     } >"$tcl"
-    sed "s/^diset tpcc mysql_pass .*/diset tpcc mysql_pass <redacted>/" "$tcl" >"$OUT/hammerdb/${PFX}_run${run}_vu${vu}.tcl"
-    if (( DRY_RUN )); then printf '  hammerdbcli auto run%s_vu%s.tcl (rampup %s min, duration %s min)\n' "$run" "$vu" "$RAMPUP_MIN" "$DURATION_MIN"; return 0; fi
-    hdb_cli "$tcl" "$log" || log "WARN: hammerdbcli run $run vu=$vu exited non-zero"
-    hdb_save_tmp_logs "run${run}_vu${vu}"
-    hammerdb_parse "$run" "$vu" "$log" >>"$HDB_CSV"
+    sed "s/^diset tpcc mysql_pass .*/diset tpcc mysql_pass <redacted>/" "$tcl" >"$OUT/hammerdb/${PFX}_$name.tcl"
+    if (( DRY_RUN )); then printf '  hammerdbcli auto %s.tcl (%s warehouses, rampup %s min, duration %s min)\n' "$name" "$wh" "$RAMPUP_MIN" "$DURATION_MIN"; return 0; fi
+    hdb_cli "$tcl" "$log" || log "WARN: hammerdbcli run $run wh=$wh vu=$vu exited non-zero"
+    hdb_save_tmp_logs "$name"
+    hammerdb_parse "$run" "$wh" "$vu" "$log" >>"$HDB_CSV"
 }
 
 hammerdb_parse() {
-    local run=$1 vu=$2 file=$3
+    local run=$1 wh=$2 vu=$3 file=$4
     # "System achieved 12345 NOPM from 34567 MySQL TPM"
-    awk -v provider="$PROVIDER" -v run="$run" -v vu="$vu" '
+    awk -v provider="$PROVIDER" -v run="$run" -v wh="$wh" -v vu="$vu" '
         /System achieved/ {
             for (i=1;i<=NF;i++) {
                 if ($i=="NOPM") nopm=$(i-1)
@@ -661,8 +732,9 @@ hammerdb_parse() {
         /FINISHED SUCCESS/           { ok=1 }
         /ERROR|FINISHED FAILED/      { errs++ }
         END {
-            printf "%s,%s,%s,%s,%s,%s,%s,%s\n",
-                   provider, "hammerdb_tpcc", run, vu, (nopm==""?"NA":nopm), (tpm==""?"NA":tpm),
+            printf "%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
+                   provider, "hammerdb_tpcc", run, wh, vu,
+                   (nopm==""?"NA":nopm), (tpm==""?"NA":tpm),
                    (ok?"ok":"check_log"), (errs==""?0:errs)
         }' "$file"
 }
@@ -674,48 +746,75 @@ hammerdb_cleanup() {
 
 # ------------------------------------------------------------------ main -----
 if (( PREPARE_ONLY )); then
-    if (( RUN_SYSBENCH )); then sysbench_prepare initial; fi
-    if (( RUN_HAMMERDB )); then hammerdb_build initial; fi
+    if (( RUN_SYSBENCH && ${#SB_SIZES[@]} > 1 )) || (( RUN_HAMMERDB && ${#HDB_WAREHOUSES[@]} > 1 )); then
+        log "--prepare-only: only the first data set of each list is loaded"
+    fi
+    if (( RUN_SYSBENCH )); then sysbench_prepare "${SB_SIZES[0]}" "s$(num_label "${SB_SIZES[0]}")"; fi
+    if (( RUN_HAMMERDB )); then hammerdb_build "${HDB_WAREHOUSES[0]}" "w${HDB_WAREHOUSES[0]}"; fi
     if (( ! DRY_RUN )); then collect_server_info; fi
     log "--prepare-only: data sets are ready, exiting"
     exit 0
 fi
 
-if (( SKIP_PREPARE )); then
-    log "--skip-prepare: reusing the existing $SB_DB / $HDB_DB data sets, no rebuild between runs"
+if [[ $REBUILD == never ]]; then
+    log "--rebuild never: reusing the existing $SB_DB / $HDB_DB data sets"
 fi
 
 if (( RUN_SYSBENCH )); then
     # elapsed_s covers ramp-up + measured window; every other column is from the
     # post-ramp-up report only.
-    printf 'provider,benchmark,run,threads,elapsed_s,transactions,tps,queries,qps,lat_min_ms,lat_avg_ms,lat_p95_ms,lat_max_ms,errors\n' >"$SB_CSV"
+    printf 'provider,benchmark,run,tables,rows_per_table,threads,elapsed_s,transactions,tps,queries,qps,lat_min_ms,lat_avg_ms,lat_p95_ms,lat_max_ms,errors\n' >"$SB_CSV"
 fi
 if (( RUN_HAMMERDB )); then
-    printf 'provider,benchmark,run,vu,nopm,tpm,status,log_errors\n' >"$HDB_CSV"
+    printf 'provider,benchmark,run,warehouses,vu,nopm,tpm,status,log_errors\n' >"$HDB_CSV"
 fi
 
+# True when the data set has to be (re)loaded before the next measured run;
+# $1 = thread level about to run.
+need_rebuild() {
+    case $REBUILD in
+        run)     return 0 ;;
+        dataset) [[ $1 == "${THREADS[0]}" ]] ;;
+        *)       return 1 ;;
+    esac
+}
+
 # Runs form the outer loop so that an aborted session still holds at least one
-# complete pass over the whole thread matrix. Every measured run starts from a
-# freshly loaded data set, so writes from the previous run cannot carry over.
-first_build=1
+# complete pass over every data set, and the data-set size is swept outside the
+# thread levels. Each measured run starts from a freshly loaded data set by
+# default, so writes from the previous run cannot carry over.
+declare -A info_done=()
 for run in $(seq 1 "$RUNS"); do
-    for thr in "${THREADS[@]}"; do
-        if (( RUN_SYSBENCH )); then
-            if (( ! SKIP_PREPARE )); then sysbench_prepare "run${run}_t${thr}"; fi
-            hdr "SYSBENCH run $run/$RUNS threads=$thr (${RAMPUP_MIN}m ramp + ${DURATION_MIN}m)"
-            measure "sysbench_r${run}_t${thr}" sysbench_exec "$run" "$thr" || true
-        fi
-        if (( RUN_HAMMERDB )); then
-            if (( ! SKIP_PREPARE )); then hammerdb_build "run${run}_vu${thr}"; fi
-            hdr "HAMMERDB TPC-C run $run/$RUNS vu=$thr (${RAMPUP_MIN}m ramp + ${DURATION_MIN}m)"
-            measure "hammerdb_r${run}_vu${thr}" hammerdb_exec "$run" "$thr" || true
-        fi
-        # Schema sizes are the same for every rebuild, so record them once.
-        if (( first_build && ! SKIP_PREPARE && ! DRY_RUN )); then
-            collect_server_info
-            first_build=0
-        fi
-    done
+    if (( RUN_SYSBENCH )); then
+        for rows in "${SB_SIZES[@]}"; do
+            size=$(num_label "$rows")
+            for thr in "${THREADS[@]}"; do
+                tag="r${run}_s${size}_t${thr}"
+                if need_rebuild "$thr"; then sysbench_prepare "$rows" "run${run}_s${size}_t${thr}"; fi
+                # Record the loaded size of each data set once.
+                if [[ -z ${info_done[sb_$size]:-} ]] && (( ! DRY_RUN )); then
+                    collect_server_info "sysbench_s$size"
+                    info_done[sb_$size]=1
+                fi
+                hdr "SYSBENCH run $run/$RUNS ${SB_TABLES}x${size} rows threads=$thr (${RAMPUP_MIN}m ramp + ${DURATION_MIN}m)"
+                measure "sysbench_$tag" sysbench_exec "$run" "$rows" "$thr" || true
+            done
+        done
+    fi
+    if (( RUN_HAMMERDB )); then
+        for wh in "${HDB_WAREHOUSES[@]}"; do
+            for vu in "${THREADS[@]}"; do
+                tag="r${run}_w${wh}_vu${vu}"
+                if need_rebuild "$vu"; then hammerdb_build "$wh" "run${run}_w${wh}_vu${vu}"; fi
+                if [[ -z ${info_done[hdb_$wh]:-} ]] && (( ! DRY_RUN )); then
+                    collect_server_info "hammerdb_w$wh"
+                    info_done[hdb_$wh]=1
+                fi
+                hdr "HAMMERDB TPC-C run $run/$RUNS ${wh}w vu=$vu (${RAMPUP_MIN}m ramp + ${DURATION_MIN}m)"
+                measure "hammerdb_$tag" hammerdb_exec "$run" "$wh" "$vu" || true
+            done
+        done
+    fi
 done
 
 if (( ! DRY_RUN )); then
@@ -733,17 +832,22 @@ hdr "SUMMARY"
     cat "$OUT/${PFX}_config.txt"
     echo
     if (( RUN_SYSBENCH )) && [[ -s $SB_CSV ]]; then
-        echo "sysbench oltp_read_write - mean over $RUNS run(s)"
-        awk -F, 'NR>1 && $7!="" { t[$4]+=$7; q[$4]+=$9; l[$4]+=$11; p[$4]+=$12; n[$4]++ }
-             END { printf "  %-8s %12s %12s %12s %12s\n","threads","tps","qps","avg_ms","p95_ms"
-                   for (k in n) printf "  %-8s %12.2f %12.2f %12.2f %12.2f\n", k, t[k]/n[k], q[k]/n[k], l[k]/n[k], p[k]/n[k] }' "$SB_CSV" | sort -k1 -n
+        echo "sysbench oltp_read_write - mean over $RUNS run(s), $SB_TABLES tables"
+        printf '  %-14s %-8s %12s %12s %12s %12s\n' "rows/table" "threads" "tps" "qps" "avg_ms" "p95_ms"
+        awk -F, 'NR>1 && $9!="" { k=$5" "$6; t[k]+=$9; q[k]+=$11; l[k]+=$13; p[k]+=$14; n[k]++ }
+             END { for (k in n) { split(k, a, " ")
+                       printf "  %-14s %-8s %12.2f %12.2f %12.2f %12.2f\n", a[1], a[2],
+                              t[k]/n[k], q[k]/n[k], l[k]/n[k], p[k]/n[k] } }' "$SB_CSV" \
+            | sort -k1,1n -k2,2n
         echo
     fi
     if (( RUN_HAMMERDB )) && [[ -s $HDB_CSV ]]; then
         echo "HammerDB TPC-C - mean over $RUNS run(s)"
-        awk -F, 'NR>1 && $5!="NA" { o[$4]+=$5; m[$4]+=$6; n[$4]++ }
-             END { printf "  %-8s %12s %12s\n","vu","nopm","tpm"
-                   for (k in n) printf "  %-8s %12.1f %12.1f\n", k, o[k]/n[k], m[k]/n[k] }' "$HDB_CSV" | sort -k1 -n
+        printf '  %-14s %-8s %12s %12s\n' "warehouses" "vu" "nopm" "tpm"
+        awk -F, 'NR>1 && $6!="NA" { k=$4" "$5; o[k]+=$6; m[k]+=$7; n[k]++ }
+             END { for (k in n) { split(k, a, " ")
+                       printf "  %-14s %-8s %12.1f %12.1f\n", a[1], a[2], o[k]/n[k], m[k]/n[k] } }' "$HDB_CSV" \
+            | sort -k1,1n -k2,2n
         echo
     fi
     echo "finished_utc      $(date -u +%Y-%m-%dT%H:%M:%SZ)"
