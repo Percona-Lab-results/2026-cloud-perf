@@ -552,6 +552,7 @@ diset tpcc mysql_num_vu $HDB_BUILD_VU
 diset tpcc mysql_storage_engine innodb
 diset tpcc mysql_partition false
 diset tpcc mysql_no_stored_procs $HDB_NO_STORED_PROCS
+diset tpcc mysql_history_pk true
 buildschema
 EOF
     } >"$tcl"
