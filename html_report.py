@@ -24,6 +24,11 @@ SERIES_DARK = ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#008300"]
 MARKERS = ["circle", "square", "triangle", "diamond", "triangleDown", "plus"]
 
 
+def txn_word(bench: str) -> str:
+    """What one counted unit of work is called in this benchmark."""
+    return "transactions" if bench == "sysbench" else "TPC-C transactions"
+
+
 def build_payload(aggs: dict, sessions: list, root: Path, specs: dict,
                   pretty, label_dataset, cost_usd, cost_native, fx: dict) -> dict:
     """Shape the Agg objects into the JSON the page's renderer consumes."""
@@ -54,11 +59,20 @@ def build_payload(aggs: dict, sessions: list, root: Path, specs: dict,
                          agg.runs.get((provider, dataset, conc), [])],
             }
         peaks = {}
+        # Work done, summed over every concurrency level and every run: the
+        # basis of cost efficiency.  Keyed by data-set size, plus "all".
+        totals = {}
         for provider in agg.providers:
             for dataset in agg.datasets:
                 value, at = agg.peak(provider, dataset)
                 if value is not None:
                     peaks[f"{provider}|{dataset}"] = {"value": round(value, 2), "at": at}
+            for dataset in list(agg.datasets) + [None]:
+                txn, nord, count = agg.total(provider, dataset)
+                if txn:
+                    totals[f"{provider}|{'all' if dataset is None else dataset}"] = {
+                        "txn": round(txn), "nord": round(nord), "n": count,
+                    }
         payload["benches"].append({
             "key": bench,
             "title": spec["title"].split(" - ")[0],
@@ -84,6 +98,8 @@ def build_payload(aggs: dict, sessions: list, root: Path, specs: dict,
             "concurrency": agg.concurrency,
             "cells": cells,
             "peaks": peaks,
+            "totals": totals,
+            "txnWord": txn_word(bench),
             "incomplete": [{"provider": p, "name": pretty(p), "dataset": d,
                             "datasetLabel": label_dataset(bench, d), "have": have}
                            for p, d, have in agg.incomplete()],
@@ -347,6 +363,22 @@ TEMPLATE = r"""<!DOCTYPE html>
     // numbers and "20.0" is just noise there.
     if (v >= 100 || Math.abs(v - Math.round(v)) < 0.05) return Math.round(v).toLocaleString("en-US");
     return v.toLocaleString("en-US", { minimumFractionDigits: 1, maximumFractionDigits: 1 });
+  }
+  // Transaction counts run into the tens of millions. Full digits on every
+  // tick would be a wall of zeroes, so they are scaled and suffixed; the exact
+  // figure stays in the table view and the CSV.
+  function fmtc(v) {
+    if (v === null || v === undefined) return "n/a";
+    var u = [[1e9, "B"], [1e6, "M"], [1e3, "k"]];
+    for (var i = 0; i < u.length; i++) {
+      if (Math.abs(v) >= u[i][0]) {
+        var q = v / u[i][0];
+        return (Math.abs(q) < 100
+          ? q.toLocaleString("en-US", { minimumFractionDigits: 1, maximumFractionDigits: 1 })
+          : Math.round(q).toLocaleString("en-US")) + u[i][1];
+      }
+    }
+    return Math.round(v).toLocaleString("en-US");
   }
   function usd(v) {
     if (v === null || v === undefined) return "n/a";
@@ -839,35 +871,47 @@ TEMPLATE = r"""<!DOCTYPE html>
     });
 
     function peak(p, d) { return bench.peaks[p + "|" + d] || null; }
+    function total(p, d) { return bench.totals[p + "|" + d] || null; }
 
     function render() {
       plot.textContent = "";
       tip.hide();
 
       var d = datasetOf(bench, state.dataset);
-      var individual = state.mode === "individual";
-      var nf = eff ? fmtp : fmt;
+      // A total already contains every run, so the average/individual control
+      // has nothing left to say about it.
+      var individual = !eff && state.mode === "individual";
+      var nf = eff ? fmtc : fmt;
       titleNode.textContent = (eff ? bench.effTitle : bench.peakTitle) + " - " + d.label;
       subNode.textContent = (eff ? bench.effSub : bench.peakSub) + (individual
-        ? " Each run marked on the bar." : "");
+        ? " Each run marked on the bar."
+        : eff ? " Every run at this size is in the sum." : "");
 
       var surface = cssVar("--surface-1"), grid = cssVar("--grid"),
           axis = cssVar("--axis"), muted = cssVar("--text-muted"),
           secondary = cssVar("--text-secondary"), primary = cssVar("--text-primary");
 
-      // In cost mode every value is divided by what the instance cost. An
-      // unpriced provider is dropped rather than drawn at zero, which would
-      // read as "no throughput per dollar" instead of "price unknown".
-      function div(p) { return eff ? (p.costUsd || 0) : 1; }
+      // Two measures, one renderer. The peak bar is a rate; the cost bar is
+      // every transaction completed at this size - all concurrency levels, all
+      // runs - over what the instance cost. An unpriced provider is dropped
+      // rather than drawn at zero, which would read as "no work per dollar"
+      // instead of "price unknown".
       function peakOf(p, dsv) {
-        var q = peak(p.key, dsv), c = div(p);
-        return (!q || !c) ? null : { value: q.value / c, at: q.at, raw: q.value };
+        if (!eff) {
+          var q = peak(p.key, dsv);
+          return q ? { value: q.value, at: q.at } : null;
+        }
+        var w = total(p.key, dsv);
+        return (!w || !p.costUsd) ? null
+          : { value: w.txn / p.costUsd, at: null, raw: w.txn, n: w.n };
       }
       function detailOf(p, dsv, at) {
-        var c0 = bench.cells[p.key + "|" + dsv + "|" + at], c = div(p);
-        return (!c0 || !c) ? null : {
-          min: c0.min / c, max: c0.max / c, runs: c0.runs,
-          vals: c0.vals.map(function (rv) { return rv[1] / c; }),
+        // A sum has no single concurrency level behind it, so no run detail.
+        if (eff || at === null) return null;
+        var c0 = bench.cells[p.key + "|" + dsv + "|" + at];
+        return !c0 ? null : {
+          min: c0.min, max: c0.max, runs: c0.runs,
+          vals: c0.vals.map(function (rv) { return rv[1]; }),
         };
       }
 
@@ -918,15 +962,19 @@ TEMPLATE = r"""<!DOCTYPE html>
       });
       svg.appendChild(svgEl("line", { x1: M.l, y1: M.t, x2: M.l, y2: M.t + ph, stroke: axis, "stroke-width": 1 }));
       var xlab = svgEl("text", { x: M.l + pw / 2, y: H - 8, "text-anchor": "middle", fill: secondary, "font-size": 13 });
-      xlab.textContent = eff ? bench.metric + " per USD of spend" : bench.metricLong;
+      xlab.textContent = eff
+        ? bench.txnWord.charAt(0).toUpperCase() + bench.txnWord.slice(1) + " per USD of spend"
+        : bench.metricLong;
       svg.appendChild(xlab);
 
       rows.forEach(function (r, i) {
         var yTop = M.t + i * PITCH, yc = yTop + PITCH / 2;
         var g = svgEl("g", { tabindex: "0", role: "img" });
         g.setAttribute("aria-label", r.p.name + ", " + d.label + ": " + (r.q
-          ? nf(r.q.value) + " " + bench.metric + (eff ? " per USD" : "")
-            + " at " + bench.concShort + "=" + r.q.at
+          ? eff
+            ? nf(r.q.value) + " " + bench.txnWord + " per USD, "
+              + fmt(r.q.raw) + " over " + r.q.n + " measurements"
+            : nf(r.q.value) + " " + bench.metric + " at " + bench.concShort + "=" + r.q.at
           : eff && !r.p.costUsd ? "not priced" : "no data"));
 
         var name = svgEl("text", { x: M.l - 14, y: yc + 4.5, "text-anchor": "end", fill: secondary, "font-size": 13 });
@@ -967,7 +1015,8 @@ TEMPLATE = r"""<!DOCTYPE html>
         // In cost mode the second line carries the two numbers the ratio came
         // from, so the bar is never an unexplained quotient.
         v2.textContent = eff
-          ? fmt(r.q.raw) + " / " + usd(r.p.costUsd)
+          ? fmtc(r.q.raw) + " " + bench.txnWord + " / " + usd(r.p.costUsd)
+            + "  \u00b7  n=" + r.q.n
           : bench.concShort + "=" + r.q.at + (!at ? "" : individual
             ? "  \u00b7  " + at.vals.map(function (rv) { return fmt(rv); }).join("  \u00b7  ")
             : "  \u00b7  " + fmt(at.min) + "\u2013" + fmt(at.max) + " / n=" + at.runs);
@@ -992,10 +1041,12 @@ TEMPLATE = r"""<!DOCTYPE html>
           var c0 = at;
           tip.show(r.p.name + " - " + d.label, [{
             color: color,
-            name: bench.metric + (eff ? " per USD" : "") + " at " + bench.concShort + "=" + r.q.at,
+            name: eff ? bench.txnWord + " per USD of spend"
+                      : bench.metric + " at " + bench.concShort + "=" + r.q.at,
             value: nf(r.q.value),
             range: eff
-              ? fmt(r.q.raw) + " " + bench.metric + " / " + usd(r.p.costUsd) + " ("
+              ? fmt(r.q.raw) + " " + bench.txnWord + " over " + r.q.n
+                + " measurements / " + usd(r.p.costUsd) + " ("
                 + r.p.costNative + " " + r.p.costCurrency + ")"
               : !c0 ? "" : individual
                 ? "runs: " + c0.vals.map(function (rv) { return fmt(rv); }).join(", ")
@@ -1102,8 +1153,11 @@ TEMPLATE = r"""<!DOCTYPE html>
 
   function buildPeakTable(host, bench, eff) {
     var t = tableShell(host, eff
-      ? "Peak " + bench.metric + " per USD of instance spend, with the peak and the price "
-        + "it was divided by. FX as of " + DATA.fx.asof + " (" + DATA.fx.source + ")."
+      ? bench.txnWord + " completed per USD of instance spend: every transaction of "
+        + "every run at that data-set size, summed, over the price of the instance. "
+        + "The sub-line is the total and the price it was divided by, and n is how "
+        + "many measurements went into the sum - a provider with fewer is doing less "
+        + "work, not slower work. FX as of " + DATA.fx.asof + " (" + DATA.fx.source + ")."
       : "Peak " + bench.metric + " per provider and data set, with the "
         + bench.concLabel.toLowerCase() + " level that reached it. Every data set, not just "
         + "the selected one.");
@@ -1111,6 +1165,7 @@ TEMPLATE = r"""<!DOCTYPE html>
     hr.appendChild(el("th", null, "Provider"));
     if (eff) hr.appendChild(el("th", null, "Cost"));
     bench.datasets.forEach(function (d) { hr.appendChild(el("th", null, d.label)); });
+    if (eff) hr.appendChild(el("th", null, "All sizes"));
     thead.appendChild(hr);
     t.appendChild(thead);
     var tb = el("tbody");
@@ -1125,17 +1180,27 @@ TEMPLATE = r"""<!DOCTYPE html>
         }
         tr.appendChild(ct);
       }
-      bench.datasets.forEach(function (d) {
-        var q = bench.peaks[p.key + "|" + d.value];
+      var keys = bench.datasets.map(function (d) { return d.value; });
+      if (eff) keys.push("all");
+      keys.forEach(function (k) {
         var td = el("td");
-        if (!q || (eff && !p.costUsd)) {
-          td.appendChild(document.createTextNode("-"));
-        } else if (eff) {
-          td.appendChild(document.createTextNode(fmtp(q.value / p.costUsd)));
-          td.appendChild(el("div", "range", fmt(q.value) + " / " + usd(p.costUsd)));
+        if (eff) {
+          var w = bench.totals[p.key + "|" + k];
+          if (!w || !p.costUsd) {
+            td.appendChild(document.createTextNode("-"));
+          } else {
+            td.appendChild(document.createTextNode(fmtc(w.txn / p.costUsd)));
+            td.appendChild(el("div", "range",
+              fmt(w.txn) + " / " + usd(p.costUsd) + "  \u00b7  n=" + w.n));
+          }
         } else {
-          td.appendChild(document.createTextNode(fmt(q.value)));
-          td.appendChild(el("div", "range", bench.concShort + "=" + q.at));
+          var q = bench.peaks[p.key + "|" + k];
+          if (!q) {
+            td.appendChild(document.createTextNode("-"));
+          } else {
+            td.appendChild(document.createTextNode(fmt(q.value)));
+            td.appendChild(el("div", "range", bench.concShort + "=" + q.at));
+          }
         }
         tr.appendChild(td);
       });

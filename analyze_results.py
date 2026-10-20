@@ -115,9 +115,28 @@ class Session:
         self.csv_path = csv_path
         self.rows: list[dict] = []
         self.dropped = 0
+        self.window_s = session_window(path)
 
     def __repr__(self) -> str:
         return f"<{self.provider} {self.stamp} {self.bench} n={len(self.rows)}>"
+
+
+# The HammerDB CSV reports rates, not counts, so turning them back into work
+# done needs the length of the measured window.  Read it from the run's own
+# config rather than assuming the harness default, which is overridable.
+WINDOW_DEFAULT_S = 20 * 60
+DURATION_LINE = re.compile(r"^duration_min\s+(\d+)")
+
+
+def session_window(path: Path) -> int:
+    for cfg in sorted(path.glob("*_config.txt")):
+        for line in cfg.read_text(errors="replace").splitlines():
+            m = DURATION_LINE.match(line)
+            if m:
+                return int(m.group(1)) * 60
+    print(f"analyze_results.py: no duration_min in {path.name}, assuming "
+          f"{WINDOW_DEFAULT_S // 60} min", file=sys.stderr)
+    return WINDOW_DEFAULT_S
 
 
 def discover(root: Path) -> list[Session]:
@@ -144,19 +163,38 @@ def _num(value: str) -> float | None:
 
 
 def load(session: Session) -> None:
-    """Read the session CSV into rows of {dataset, concurrency, metric, run}."""
-    # sysbench: provider,benchmark,run,tables,rows_per_table,threads,...,tps(9)
+    """Read the session CSV into rows of {dataset, conc, metric, txn, run}.
+
+    `txn` is the work the measurement actually did - a count, not a rate - so
+    that the runs of a provider can be summed.  sysbench reports the count
+    itself (its post-ramp-up block, hence transactions == tps * window);
+    HammerDB reports only rates, so the count comes back from tpm * window.
+    """
+    # sysbench: provider,benchmark,run,tables,rows_per_table,threads,
+    #           elapsed_s,transactions,tps,queries,qps,...
     # hammerdb: provider,benchmark,run,warehouses,vu,nopm,tpm,status,log_errors
     key = ("rows_per_table", "threads", "tps") if session.bench == "sysbench" \
         else ("warehouses", "vu", "nopm")
+    minutes = session.window_s / 60.0
     with session.csv_path.open(newline="") as fh:
         for rec in csv.DictReader(fh):
             dataset, conc, metric = (_num(rec.get(k, "")) for k in key)
             if None in (dataset, conc, metric) or metric <= 0:
                 session.dropped += 1
                 continue
+            if session.bench == "sysbench":
+                # Counted by sysbench; derived only if that column is missing.
+                txn = _num(rec.get("transactions", "")) or metric * session.window_s
+                nord = txn
+            else:
+                # TPC-C counts all five transaction types; new orders are the
+                # metric of record, so both are kept.
+                tpm = _num(rec.get("tpm", "")) or 0.0
+                nord = metric * minutes
+                txn = tpm * minutes or nord
             session.rows.append(dict(
                 dataset=int(dataset), conc=int(conc), metric=metric,
+                txn=txn, nord=nord,
                 run=int(_num(rec.get("run", "0")) or 0),
                 provider=rec.get("provider", session.provider).strip() or session.provider,
             ))
@@ -172,10 +210,18 @@ class Agg:
         self.sessions = sessions
         bucket: dict[tuple[str, int, int], list[float]] = defaultdict(list)
         runs: dict[tuple[str, int, int], list[tuple[int, float]]] = defaultdict(list)
+        # Work done, summed over every measurement: all concurrency levels, all
+        # runs.  [transactions, new-order transactions, measurements].
+        work: dict[tuple[str, int], list[float]] = defaultdict(lambda: [0.0, 0.0, 0])
         for s in sessions:
             for r in s.rows:
                 bucket[(s.provider, r["dataset"], r["conc"])].append(r["metric"])
                 runs[(s.provider, r["dataset"], r["conc"])].append((r["run"], r["metric"]))
+                w = work[(s.provider, r["dataset"])]
+                w[0] += r["txn"]
+                w[1] += r["nord"]
+                w[2] += 1
+        self.work = dict(work)
         self.stats = {k: (float(np.mean(v)), float(np.min(v)), float(np.max(v)), len(v))
                       for k, v in bucket.items()}
         # Kept in run order so "individual runs" is a stable series, not a set.
@@ -201,6 +247,17 @@ class Agg:
                 best = (value, conc)
         return best
 
+    def total(self, provider: str, dataset: int | None = None):
+        """Transactions summed over all runs - of one data-set size, or of the
+        whole benchmark when dataset is None.  Returns (txn, new orders, n)."""
+        keys = [(provider, dataset)] if dataset is not None else \
+            [(provider, d) for d in self.datasets]
+        rows = [self.work[k] for k in keys if k in self.work]
+        if not rows:
+            return (None, None, 0)
+        return (sum(r[0] for r in rows), sum(r[1] for r in rows),
+                int(sum(r[2] for r in rows)))
+
     def incomplete(self) -> list[tuple[str, int, list[int]]]:
         """Provider/data-set pairs that did not cover the whole sweep - their
         'peak' is a peak over fewer levels, so it is not directly comparable."""
@@ -219,6 +276,20 @@ def label_dataset(bench: str, value: int) -> str:
     if bench == "sysbench":
         return f"{value // 1_000_000}M rows/table" if value >= 1_000_000 else f"{value:,} rows/table"
     return f"{value} warehouses"
+
+
+def txn_word(bench: str) -> str:
+    """What one counted unit of work is called in this benchmark."""
+    return "transactions" if bench == "sysbench" else "TPC-C transactions"
+
+
+def compact(v: float) -> str:
+    """A large count at a glance: 43.2M, 431k, 86."""
+    for scale, suffix in ((1e9, "B"), (1e6, "M"), (1e3, "k")):
+        if abs(v) >= scale:
+            q = v / scale
+            return f"{q:,.1f}{suffix}" if abs(q) < 100 else f"{q:,.0f}{suffix}"
+    return f"{v:,.0f}"
 
 
 def slug_dataset(bench: str, value: int) -> str:
@@ -366,8 +437,9 @@ def chart_peak(agg: Agg, mode: str, out: Path, metric: str, conc_short: str,
                title: str, subtitle: str, dataset: int, per_usd: bool = False) -> Path:
     """Peak throughput per provider at one data-set size, one bar per provider.
 
-    With per_usd the same ranking is divided by what the instance cost, so the
-    bars read as throughput bought per dollar rather than throughput.
+    With per_usd the bar is instead every transaction the provider completed at
+    that size - summed over all concurrency levels and all runs - divided by
+    what the instance cost, so it reads as work bought per dollar.
     """
     t = style(mode)
     colors = SERIES[mode]
@@ -377,16 +449,24 @@ def chart_peak(agg: Agg, mode: str, out: Path, metric: str, conc_short: str,
     # thing here that wants more is the title.
     fig, ax = plt.subplots(figsize=(5.6, 5.3 if gaps else 5.0))
     unit = metric.split()[0]
-    chrome(ax, t, f"{unit} per USD of spend" if per_usd else metric)
+    # Only the first letter: .capitalize() would turn "TPC-C" into "Tpc-c".
+    word = txn_word(agg.bench)
+    chrome(ax, t, f"{word[0].upper()}{word[1:]} per USD of spend"
+           if per_usd else metric)
+    if per_usd:
+        # Counts run into the tens of millions; full digits on every tick would
+        # be a wall of zeroes.
+        ax.yaxis.set_major_formatter(lambda v, _pos: compact(v))
 
-    def value_at(provider: str, dataset: int) -> tuple[float | None, int | None]:
-        value, at = agg.peak(provider, dataset)
+    def value_at(provider: str, dataset: int) -> tuple[float | None, float | None]:
+        """(bar height, the count behind it) - the count is None off per_usd."""
         if not per_usd:
-            return value, at
+            return agg.peak(provider, dataset)
+        txn, _nord, _n = agg.total(provider, dataset)
         usd = cost_usd(provider)
         # An unpriced provider gets no bar; a zero-height one would read as
-        # "no throughput per dollar" rather than "price unknown".
-        return (None, None) if value is None or not usd else (value / usd, at)
+        # "no work per dollar" rather than "price unknown".
+        return (None, None) if not txn or not usd else (txn / usd, txn)
 
     peaks = {(0, i): value_at(p, dataset) for i, p in enumerate(agg.providers)}
     # Scaled to the largest bar across *all* sizes, not just this one, so the
@@ -399,9 +479,11 @@ def chart_peak(agg: Agg, mode: str, out: Path, metric: str, conc_short: str,
     ax.set_xlim(-0.55, 0.55)
     ax.set_ylim(0, ymax * 1.16)
 
-    # A peak taken over a partial sweep is not comparable with a full one; say so
-    # rather than letting the bar imply otherwise.
-    note = "Incomplete sweep, peak taken over fewer levels: " + "; ".join(
+    # A peak taken over a partial sweep is not comparable with a full one, and a
+    # sum over fewer measurements even less so - it is less work, not slower
+    # work.  Say it rather than letting the bar imply otherwise.
+    note = ("Summed over fewer measurements, so not comparable: " if per_usd else
+            "Incomplete sweep, peak taken over fewer levels: ") + "; ".join(
         f"{pretty(p)} {label_dataset(agg.bench, d)} ({conc_short}="
         f"{', '.join(str(c) for c in have)} only)" for p, d, have in gaps)
     # Wrapped to the figure, not run off its right edge: a footnote that is cut
@@ -440,8 +522,11 @@ def chart_peak(agg: Agg, mode: str, out: Path, metric: str, conc_short: str,
         leader = max((v[0] for (gg, _), v in peaks.items()
                       if gg == g and v[0] is not None), default=None)
         if value == leader:
-            shown = f"{value:,.1f}" if per_usd and value < 100 else f"{value:,.0f}"
-            ax.annotate(f"{shown}\n{conc_short}={at}",
+            # In cost mode the second line is the quotient's two inputs, so the
+            # bar is never an unexplained ratio.
+            second = (f"{compact(at)} / {cost_usd(agg.providers[i]):,.2f} USD"
+                      if per_usd else f"{conc_short}={at}")
+            ax.annotate(f"{compact(value) if per_usd else f'{value:,.0f}'}\n{second}",
                         (x, value), textcoords="offset points", xytext=(0, 6),
                         ha="center", va="bottom", fontsize=8.5,
                         color=t["secondary"], linespacing=1.3, zorder=5)
@@ -484,56 +569,79 @@ def report_costs(providers: list[str]) -> None:
 
 
 def report_efficiency(agg: Agg, metric: str) -> None:
-    unit = metric.split()[0]
-    print(f"\n{agg.bench}: cost efficiency - peak {unit} per USD of spend")
-    head = "  " + f"{'provider':<14}{'USD':>9}" + "".join(
-        f"{label_dataset(agg.bench, d):>24}" for d in agg.datasets)
+    """Cost efficiency as total work per dollar: every transaction of every run
+    at a data-set size, divided by the price of the instance."""
+    word = txn_word(agg.bench)
+    print(f"\n{agg.bench}: cost efficiency - {word} completed per USD of spend")
+    print("  (sum over all concurrency levels and all runs of the measured window)")
+    head = "  " + f"{'provider':<14}{'USD':>9}{'n':>5}" + "".join(
+        f"{label_dataset(agg.bench, d):>26}" for d in agg.datasets) + f"{'all sizes':>26}"
     print(head)
     ranked = []
     for provider in agg.providers:
         usd = cost_usd(provider)
-        line = "  " + f"{pretty(provider):<14}" + (f"{usd:>9,.0f}" if usd else f"{'-':>9}")
-        for dataset in agg.datasets:
-            value, _at = agg.peak(provider, dataset)
-            if value is None or not usd:
-                line += f"{'no data' if value is None else 'not priced':>24}"
+        _t, _n, count = agg.total(provider)
+        line = ("  " + f"{pretty(provider):<14}"
+                + (f"{usd:>9,.0f}" if usd else f"{'-':>9}") + f"{count:>5}")
+        for dataset in list(agg.datasets) + [None]:
+            txn, _nord, _n = agg.total(provider, dataset)
+            if not txn or not usd:
+                line += f"{'no data' if not txn else 'not priced':>26}"
                 continue
-            per = value / usd
-            line += f"{f'{per:,.1f} {unit}/USD':>24}"
-            if dataset == agg.datasets[0]:
-                ranked.append((per, provider))
+            per = txn / usd
+            line += f"{f'{compact(per)} / USD':>26}"
+            if dataset is None:
+                ranked.append((per, provider, txn))
         print(line)
     if ranked:
         ranked.sort(reverse=True)
         best, worst = ranked[0], ranked[-1]
-        print(f"  best value at {label_dataset(agg.bench, agg.datasets[0])}: "
-              f"{pretty(best[1])} ({best[0]:,.1f} {unit}/USD), "
-              f"{best[0] / worst[0]:.1f}x {pretty(worst[1])}")
+        print(f"  totals: {pretty(best[1])} completed {compact(best[2])} {word} "
+              f"= {compact(best[0])} per USD, "
+              f"{best[0] / worst[0]:.1f}x {pretty(worst[1])} ({compact(worst[0])} per USD)")
+    # A sum is only as comparable as its coverage: a provider with missing
+    # measurements shows less work done, which is not the same as slower work.
+    counts = {p: agg.total(p)[2] for p in agg.providers}
+    full = max(counts.values(), default=0)
+    short = [(p, c) for p, c in counts.items() if c < full]
+    if short:
+        print("  NOT comparable - fewer measurements in the sum: " + "; ".join(
+            f"{pretty(p)} n={c} of {full}" for p, c in short))
 
 
 def write_cost_table(aggs: dict, out: Path) -> Path:
-    """Peak throughput, price and throughput-per-USD, one row per slice."""
+    """Work done, price and work-per-USD, one row per provider/data-set size
+    plus an all-sizes row.  The peak rate stays in as context for the sum."""
     with out.open("w", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(["benchmark", "provider", "dataset", "dataset_label", "metric",
-                    "peak", "at_concurrency", "cost_as_billed", "currency",
-                    "usd_per_unit", "cost_usd", "peak_per_usd"])
+        w.writerow(["benchmark", "provider", "dataset", "dataset_label",
+                    "measurements", "total_transactions", "total_new_orders",
+                    "peak_metric", "peak", "at_concurrency",
+                    "cost_as_billed", "currency", "usd_per_unit", "cost_usd",
+                    "transactions_per_usd", "new_orders_per_usd"])
         for bench, agg in aggs.items():
             unit = BENCH_SPEC[bench]["metric"].split()[0]
             for provider in agg.providers:
                 native, usd = cost_native(provider), cost_usd(provider)
-                for dataset in agg.datasets:
-                    value, at = agg.peak(provider, dataset)
-                    if value is None:
+                for dataset in list(agg.datasets) + [None]:
+                    txn, nord, count = agg.total(provider, dataset)
+                    if not txn:
                         continue
+                    peak, at = (agg.peak(provider, dataset) if dataset is not None
+                                else (None, None))
                     w.writerow([
-                        bench, provider, dataset, label_dataset(bench, dataset), unit,
-                        f"{value:.2f}", at,
+                        bench, provider,
+                        "" if dataset is None else dataset,
+                        "all sizes" if dataset is None else label_dataset(bench, dataset),
+                        count, f"{txn:.0f}", f"{nord:.0f}",
+                        unit, "" if peak is None else f"{peak:.2f}",
+                        "" if at is None else at,
                         "" if native is None else f"{native[0]:.2f}",
                         "" if native is None else native[1],
                         "" if native is None else f"{FX_USD_PER[native[1]]:.6f}",
                         "" if usd is None else f"{usd:.2f}",
-                        "" if usd is None else f"{value / usd:.3f}",
+                        "" if usd is None else f"{txn / usd:.1f}",
+                        "" if usd is None else f"{nord / usd:.1f}",
                     ])
     return out
 
@@ -562,7 +670,7 @@ BENCH_SPEC = {
         peak_title="sysbench oltp_read_write - peak throughput",
         peak_sub="Best thread level per provider, at the data-set size named below",
         eff_title="sysbench oltp_read_write - cost efficiency",
-        eff_sub="Peak TPS per USD of instance spend",
+        eff_sub="Transactions completed across all runs per USD of instance spend",
         table="summary_sysbench_tps.csv",
     ),
     "hammerdb": dict(
@@ -573,7 +681,7 @@ BENCH_SPEC = {
         peak_title="HammerDB TPC-C - peak throughput",
         peak_sub="Best virtual-user level per provider, at the warehouse count named below",
         eff_title="HammerDB TPC-C - cost efficiency",
-        eff_sub="Peak NOPM per USD of instance spend",
+        eff_sub="TPC-C transactions across all runs per USD of instance spend",
         table="summary_hammerdb_nopm.csv",
     ),
 }
