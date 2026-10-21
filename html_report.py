@@ -10,8 +10,14 @@ figure has a table view beside it.  There is no CDN dependency - the file works
 offline and can be copied anywhere.
 
 Each benchmark section also reads its data-set size from the URL, one query key
-per benchmark - index.html?sysbench=40&hammerdb=320 - so a link can point at the
-slice being discussed instead of describing which buttons to press.
+per benchmark - index.html?sysbench=40 or index.html?hammerdb=320 - and rewrites
+it when the size is picked, naming just the section that was picked and scrolling
+to it, so a link can point at the slice being discussed instead of describing
+which buttons to press.  Both keys are still honoured if a URL carries them.
+
+Which table views are open travels in the URL too, as one "tables" key listing
+them - index.html?hammerdb=640&tables=hammerdb-peak,cost, or tables=all for every
+one - so a link can hand someone the numbers instead of the picture.
 
 Called by analyze_results.py; the data contract is build_payload() below.
 """
@@ -256,7 +262,8 @@ TEMPLATE = r"""<!DOCTYPE html>
   }
   button:hover { color: var(--text-primary); }
   button:focus-visible { outline: 2px solid var(--series-1); outline-offset: 2px; }
-  button[aria-pressed="true"] { color: var(--text-primary); border-color: var(--axis); }
+  button[aria-pressed="true"],
+  button[aria-expanded="true"] { color: var(--text-primary); border-color: var(--axis); }
 
   section.bench { margin-top: 44px; }
   h2 {
@@ -443,6 +450,64 @@ TEMPLATE = r"""<!DOCTYPE html>
   // Color follows the provider, never its rank, so isolating a series in the
   // legend cannot repaint the survivors.
   function colorOf(p) { return isDark() ? p.dark : p.light; }
+
+  // ------------------------------------------------------- table heat ramp ---
+  // Ranking wash for the table cells: best green, worst red, through a neutral
+  // grey rather than a third hue, so the middle of the field reads as "middle"
+  // instead of as its own category.
+  //
+  // These are status steps, deliberately not the categorical hues - those belong
+  // to providers, and a provider must not look like a verdict. The wash is never
+  // the only encoding either: every cell it tints prints its own number, carries
+  // its rank in the title, and the shading is explained in the caption, so a
+  // reader who cannot separate red from green loses nothing but a scanning aid.
+  var HEAT = {
+    light: { good: [22, 122, 73], bad: [176, 36, 40], mid: [140, 138, 130], gain: 0.22 },
+    dark: { good: [46, 166, 105], bad: [206, 74, 66], mid: [140, 138, 130], gain: 0.34 },
+  };
+
+  // t runs 0 (worst) to 1 (best); null leaves the cell alone.
+  function heat(t) {
+    if (t === null) return "";
+    var h = HEAT[isDark() ? "dark" : "light"];
+    var pole = t < 0.5 ? h.bad : h.good;
+    var w = Math.abs(t - 0.5) * 2;
+    var rgb = [0, 1, 2].map(function (i) {
+      return Math.round(h.mid[i] + (pole[i] - h.mid[i]) * w);
+    });
+    return "rgba(" + rgb.join(",") + "," + (0.05 + h.gain * w).toFixed(3) + ")";
+  }
+
+  // Where one value sits in the spread of its column. By value, not by rank, so
+  // a field with one runaway winner looks like one - four near-equal providers
+  // do not get spaced out into four distinct verdicts.
+  function heatT(vals, v, higherIsBetter) {
+    if (v === null || v === undefined || vals.length < 2) return null;
+    var lo = Math.min.apply(null, vals), hi = Math.max.apply(null, vals);
+    if (!(hi > lo)) return null;
+    var t = (v - lo) / (hi - lo);
+    return higherIsBetter ? t : 1 - t;
+  }
+
+  // "1 of 6" for the best, counting from the good end whichever end that is.
+  function heatRank(vals, v, higherIsBetter) {
+    var better = vals.filter(function (o) {
+      return higherIsBetter ? o > v : o < v;
+    }).length;
+    return (better + 1) + " of " + vals.length;
+  }
+
+  // The wash and the title in one place, so no table can tint without saying
+  // what the tint means.
+  function shade(td, vals, v, higherIsBetter, what) {
+    var t = heatT(vals, v, higherIsBetter);
+    if (t === null) return;
+    td.style.background = heat(t);
+    td.title = "Rank " + heatRank(vals, v, higherIsBetter) + " " + what;
+  }
+
+  var HEAT_CAPTION = " Cells are shaded by where each provider lands in the "
+    + "column, green best to red worst; the value is printed in every cell.";
 
   // Nice round axis ticks, so the labels carry the values that are not
   // directly labelled. The axis always rounds UP to a whole step - otherwise
@@ -660,6 +725,65 @@ TEMPLATE = r"""<!DOCTYPE html>
     return null;
   }
 
+  // The form a person types: 40 for 40,000,000 rows a table, 640 for 640
+  // warehouses. The parser takes the raw value too, but there is no reason to
+  // put eight digits in a shared link.
+  function shortSize(value) {
+    if (value === null || value === undefined) return "";
+    if (value >= 1e6 && value % 1e6 === 0) return String(value / 1e6);
+    return String(value);
+  }
+
+  // Picking a size rewrites the address bar, so whatever the reader is looking
+  // at is the thing they copy out of it. replaceState rather than pushState:
+  // the chips are a lens on one page, and filling the back button with a step
+  // per click would make Back mean something the reader did not ask for.
+  //
+  // One section per link: the URL names the benchmark that was just picked and
+  // drops the other benchmark's key, so a shared link reads as "this chart at
+  // this size" rather than as a snapshot of every control on the page.
+  // Anything else in the query string is left alone.
+  function pinSize(bench, value) {
+    DATA.benches.forEach(function (b) { delete QUERY[b.key]; });
+    QUERY[bench.key] = shortSize(value);
+    pushQuery();
+  }
+
+  // QUERY is the single source of truth for the address bar; every control
+  // edits it and then asks for one rewrite, so two controls can never disagree
+  // about what the link says.
+  function pushQuery() {
+    try {
+      var url = new URL(window.location.href);
+      url.search = "";
+      Object.keys(QUERY).forEach(function (k) {
+        if (QUERY[k] !== null && QUERY[k] !== undefined && QUERY[k] !== "") {
+          url.searchParams.set(k, QUERY[k]);
+        }
+      });
+      // A comma is legal unencoded in a query string, and the list of open
+      // tables is meant to be read and edited by hand, so %2C is put back.
+      history.replaceState(null, "",
+        url.pathname + url.search.replace(/%2C/g, ",") + url.hash);
+    } catch (e) {
+      // Opened straight off disk, where the origin is opaque and the browser
+      // refuses to rewrite the URL. The controls still work; only the link does
+      // not follow.
+    }
+  }
+
+  // The link names one section, so picking a size takes the reader to that
+  // section rather than leaving them to find it. Animated unless the reader has
+  // asked for less motion.
+  function reveal(sec) {
+    try {
+      var still = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      sec.scrollIntoView({ behavior: still ? "auto" : "smooth", block: "start" });
+    } catch (e) {
+      sec.scrollIntoView(true);
+    }
+  }
+
   function initialDataset(bench) {
     var fallback = bench.datasets.length ? bench.datasets[0].value : null;
     if (!(bench.key in QUERY)) return fallback;
@@ -716,6 +840,7 @@ TEMPLATE = r"""<!DOCTYPE html>
   // chart. Both views answer to the section's data-set and averaging controls.
   function throughputView(bench) {
     return {
+      slug: "throughput",
       cells: bench.cells, concurrency: bench.concurrency,
       metric: bench.metric, metricLong: bench.metricLong,
       title: bench.scalingTitle, sub: bench.scalingSub,
@@ -727,6 +852,7 @@ TEMPLATE = r"""<!DOCTYPE html>
     var p = bench.p95;
     if (!p) return null;
     return {
+      slug: "p95",
       cells: p.cells, concurrency: p.concurrency,
       metric: "p95", metricLong: p.metricLong,
       title: p.title, sub: p.sub,
@@ -755,7 +881,6 @@ TEMPLATE = r"""<!DOCTYPE html>
     cap.appendChild(grow);
     var tableBtn = el("button", null, "Table view");
     tableBtn.type = "button";
-    tableBtn.setAttribute("aria-pressed", "false");
     cap.appendChild(tableBtn);
     fig.appendChild(cap);
 
@@ -768,11 +893,7 @@ TEMPLATE = r"""<!DOCTYPE html>
     var tip = Tooltip(fig);
 
     var hidden = {};
-    tableBtn.addEventListener("click", function () {
-      var open = tableWrap.getAttribute("data-open") === "1";
-      tableWrap.setAttribute("data-open", open ? "0" : "1");
-      tableBtn.setAttribute("aria-pressed", open ? "false" : "true");
-    });
+    tableToggle(tableBtn, tableWrap, bench.key + "-" + view.slug);
     var levels = view.concurrency;
     function cell(p, d, c) { return view.cells[p + "|" + d + "|" + c] || null; }
 
@@ -1010,7 +1131,7 @@ TEMPLATE = r"""<!DOCTYPE html>
       plot.appendChild(svg);
       if (view.note) plot.appendChild(el("div", "note", view.note));
       buildLegend(legend, bench, hidden, false, render);
-      buildSweepTable(tableWrap, bench, individual, view);
+      buildSweepTable(tableWrap, bench, d, individual, view);
     }
 
     render();
@@ -1033,7 +1154,6 @@ TEMPLATE = r"""<!DOCTYPE html>
     cap.appendChild(grow);
     var tableBtn = el("button", null, "Table view");
     tableBtn.type = "button";
-    tableBtn.setAttribute("aria-pressed", "false");
     cap.appendChild(tableBtn);
     fig.appendChild(cap);
 
@@ -1043,11 +1163,7 @@ TEMPLATE = r"""<!DOCTYPE html>
     fig.appendChild(tableWrap);
     var tip = Tooltip(fig);
 
-    tableBtn.addEventListener("click", function () {
-      var open = tableWrap.getAttribute("data-open") === "1";
-      tableWrap.setAttribute("data-open", open ? "0" : "1");
-      tableBtn.setAttribute("aria-pressed", open ? "false" : "true");
-    });
+    tableToggle(tableBtn, tableWrap, bench.key + "-peak");
 
     function peak(p, d) { return bench.peaks[p + "|" + d] || null; }
 
@@ -1216,7 +1332,7 @@ TEMPLATE = r"""<!DOCTYPE html>
       });
 
       plot.appendChild(svg);
-      buildPeakTable(tableWrap, bench);
+      buildPeakTable(tableWrap, bench, d);
     }
 
     render();
@@ -1245,6 +1361,58 @@ TEMPLATE = r"""<!DOCTYPE html>
   }
 
   // ----------------------------------------------------------- table views --
+  // One disclosure for all three kinds of card. The table view is the chart's
+  // accessibility twin, so every card carries the same control - and it is
+  // written once rather than copied per figure, where one copy can drift.
+  //
+  // Visibility is set inline as well as through the attribute, so no stylesheet
+  // rule can out-specify it; the label flips to "Hide table" so a click that
+  // registered is visible even if the table itself were empty; and opening
+  // scrolls the table into view, because it appears below a chart that is
+  // usually taller than the viewport.
+  //
+  // Which tables are open is part of the link as well - one "tables" key
+  // carrying the open ones, or the word "all" - so a URL can hand someone the
+  // numbers rather than the picture.
+  var OPEN = (function () {
+    var want = String(QUERY.tables === undefined ? "" : QUERY.tables).toLowerCase();
+    var out = { all: /(^|,)\s*all\s*(,|$)/.test(want), set: {} };
+    want.split(",").forEach(function (s) {
+      s = s.trim().replace(/[\s_]/g, "");
+      if (s && s !== "all") out.set[s] = true;
+    });
+    return out;
+  })();
+
+  function pinTables() {
+    var open = Object.keys(OPEN.set).filter(function (k) { return OPEN.set[k]; }).sort();
+    if (open.length) QUERY.tables = open.join(",");
+    else delete QUERY.tables;
+    pushQuery();
+  }
+
+  function tableToggle(btn, wrap, slug) {
+    wrap.id = "tableview-" + slug;
+    btn.setAttribute("aria-controls", wrap.id);
+    function set(open) {
+      wrap.setAttribute("data-open", open ? "1" : "0");
+      wrap.style.display = open ? "block" : "none";
+      btn.setAttribute("aria-expanded", open ? "true" : "false");
+      btn.textContent = open ? "Hide table" : "Table view";
+      OPEN.set[slug] = open;
+    }
+    // ?tables=all opens every one; otherwise only the ones the link names.
+    set(OPEN.all || !!OPEN.set[slug]);
+    btn.addEventListener("click", function () {
+      var open = btn.getAttribute("aria-expanded") !== "true";
+      set(open);
+      pinTables();
+      // The table unfolds under a chart that is often taller than the viewport,
+      // so opening it changes nothing the reader can see. Bring it to them.
+      if (open) reveal(wrap);
+    });
+  }
+
   function tableShell(host, caption) {
     host.textContent = "";
     var t = el("table");
@@ -1262,67 +1430,95 @@ TEMPLATE = r"""<!DOCTYPE html>
     return td;
   }
 
-  function buildSweepTable(host, bench, individual, view) {
+  // The table is the chart's accessibility twin, so it shows the same data set
+  // the chart is drawing - the control governs both, and the selected size is
+  // named in the caption rather than repeated down a column.
+  function buildSweepTable(host, bench, d, individual, view) {
     var nf = view.nf, levels = view.concurrency;
-    var t = tableShell(host, view.metricLong + " - mean across runs, with "
-      + (individual ? "each run's own value" : "the min-max range") + ". "
-      + "Every data set, not just the selected one, so the controls never hide a value.");
+    var t = tableShell(host, view.metricLong + " at " + d.label
+      + " - mean across runs, with "
+      + (individual ? "each run's own value" : "the min-max range") + "."
+      + HEAT_CAPTION);
     var thead = el("thead"), hr = el("tr");
     hr.appendChild(el("th", null, "Provider"));
-    hr.appendChild(el("th", null, "Data set"));
     levels.forEach(function (c) {
       hr.appendChild(el("th", null, bench.concLabel + " " + c));
     });
     thead.appendChild(hr);
     t.appendChild(thead);
-    var tb = el("tbody");
-    bench.providers.forEach(function (p) {
-      bench.datasets.forEach(function (d) {
-        var tr = el("tr");
-        tr.appendChild(providerCell(p));
-        tr.appendChild(el("td", null, d.label));
-        levels.forEach(function (c) {
-          var v = view.cells[p.key + "|" + d.value + "|" + c];
-          var td = el("td");
-          if (!v) {
-            td.appendChild(document.createTextNode("-"));
-          } else {
-            td.appendChild(document.createTextNode(nf(v.mean)));
-            td.appendChild(el("div", "range", individual
-              ? (v.vals || []).map(function (rv) { return nf(rv[1]); }).join(" \u00b7 ")
-              : nf(v.min) + "\u2013" + nf(v.max) + " / n=" + v.runs));
-          }
-          tr.appendChild(td);
-        });
-        tb.appendChild(tr);
-      });
+    // Providers are compared against each other at the same concurrency level,
+    // so the wash runs down each column and never across a row - a row spans
+    // the sweep, where rising or falling is the point, not better or worse.
+    var column = {};
+    levels.forEach(function (c) {
+      column[c] = bench.providers.map(function (p) {
+        var v = view.cells[p.key + "|" + d.value + "|" + c];
+        return v ? v.mean : null;
+      }).filter(function (v) { return v !== null; });
     });
-    t.appendChild(tb);
-  }
-
-  function buildPeakTable(host, bench) {
-    var t = tableShell(host, "Peak " + bench.metric + " per provider and data set, with the "
-      + bench.concLabel.toLowerCase() + " level that reached it. Every data set, not just "
-      + "the selected one.");
-    var thead = el("thead"), hr = el("tr");
-    hr.appendChild(el("th", null, "Provider"));
-    bench.datasets.forEach(function (d) { hr.appendChild(el("th", null, d.label)); });
-    thead.appendChild(hr);
-    t.appendChild(thead);
     var tb = el("tbody");
     bench.providers.forEach(function (p) {
       var tr = el("tr");
       tr.appendChild(providerCell(p));
-      bench.datasets.forEach(function (d) {
-        var td = el("td"), q = bench.peaks[p.key + "|" + d.value];
-        if (!q) {
+      levels.forEach(function (c) {
+        var v = view.cells[p.key + "|" + d.value + "|" + c];
+        var td = el("td");
+        if (!v) {
           td.appendChild(document.createTextNode("-"));
         } else {
-          td.appendChild(document.createTextNode(fmt(q.value)));
-          td.appendChild(el("div", "range", bench.concShort + "=" + q.at));
+          td.appendChild(document.createTextNode(nf(v.mean)));
+          td.appendChild(el("div", "range", individual
+            ? (v.vals || []).map(function (rv) { return nf(rv[1]); }).join(" \u00b7 ")
+            : nf(v.min) + "\u2013" + nf(v.max) + " / n=" + v.runs));
+          shade(td, column[c], v.mean, view.higherIsBetter,
+                "at " + bench.concLabel.toLowerCase() + " " + c);
         }
         tr.appendChild(td);
       });
+      tb.appendChild(tr);
+    });
+    t.appendChild(tb);
+  }
+
+  // Same data set as the bars above it, in the same ranked order, so reading
+  // down the table and down the chart give the same answer.
+  function buildPeakTable(host, bench, d) {
+    var t = tableShell(host, "Peak " + bench.metric + " at " + d.label
+      + ", with the " + bench.concLabel.toLowerCase() + " level that reached it "
+      + "and the min-max range of the runs behind it." + HEAT_CAPTION);
+    var thead = el("thead"), hr = el("tr");
+    hr.appendChild(el("th", null, "Provider"));
+    hr.appendChild(el("th", null, "Peak " + bench.metric));
+    hr.appendChild(el("th", null, bench.concLabel));
+    thead.appendChild(hr);
+    t.appendChild(thead);
+    var tb = el("tbody");
+    var rows = bench.providers.map(function (p) {
+      return { p: p, q: bench.peaks[p.key + "|" + d.value] || null };
+    }).sort(function (a, b) {
+      return (b.q ? b.q.value : -1) - (a.q ? a.q.value : -1);
+    });
+    var peaks = rows.filter(function (r) { return r.q; })
+      .map(function (r) { return r.q.value; });
+    rows.forEach(function (r) {
+      var tr = el("tr");
+      tr.appendChild(providerCell(r.p));
+      var td = el("td");
+      if (!r.q) {
+        td.appendChild(document.createTextNode("-"));
+        tr.appendChild(td);
+        tr.appendChild(el("td", null, "-"));
+      } else {
+        td.appendChild(document.createTextNode(fmt(r.q.value)));
+        var c0 = bench.cells[r.p.key + "|" + d.value + "|" + r.q.at];
+        if (c0) {
+          td.appendChild(el("div", "range",
+            fmt(c0.min) + "\u2013" + fmt(c0.max) + " / n=" + c0.runs));
+        }
+        shade(td, peaks, r.q.value, true, "on peak " + bench.metric);
+        tr.appendChild(td);
+        tr.appendChild(el("td", null, bench.concShort + "=" + r.q.at));
+      }
       tb.appendChild(tr);
     });
     t.appendChild(tb);
@@ -1345,7 +1541,6 @@ TEMPLATE = r"""<!DOCTYPE html>
     cap.appendChild(grow);
     var tableBtn = el("button", null, "Table view");
     tableBtn.type = "button";
-    tableBtn.setAttribute("aria-pressed", "false");
     cap.appendChild(tableBtn);
     fig.appendChild(cap);
 
@@ -1355,11 +1550,7 @@ TEMPLATE = r"""<!DOCTYPE html>
     fig.appendChild(tableWrap);
     var tip = Tooltip(fig);
 
-    tableBtn.addEventListener("click", function () {
-      var open = tableWrap.getAttribute("data-open") === "1";
-      tableWrap.setAttribute("data-open", open ? "0" : "1");
-      tableBtn.setAttribute("aria-pressed", open ? "false" : "true");
-    });
+    tableToggle(tableBtn, tableWrap, "cost");
 
     function render() {
       plot.textContent = "";
@@ -1508,13 +1699,15 @@ TEMPLATE = r"""<!DOCTYPE html>
       if (cheap === null || r < cheap) cheap = r;
       if (dear === null || r > dear) dear = r;
     });
+    // Only quotable when at least one provider has both a bill and an uptime.
+    var span = cheap === null ? "" : ", at " + cheap.toFixed(2) + " to "
+      + dear.toFixed(2) + " USD per host-hour";
     return "Counted as Com_commit + Com_rollback on the database server itself, "
       + "from the first capture to the last, so schema builds, data loads, ramp-ups "
       + "and idle time count alongside the measured runs. The price is what each "
       + "provider has billed for running the host up to now - usage accrued to date, "
       + "not a flat rate - so the hours each campaign took are already in the "
-      + "denominator, at " + cheap.toFixed(2) + " to " + dear.toFixed(2) + " USD per "
-      + "host-hour; idle hours cost money and commit nothing, which is the point. "
+      + "denominator" + span + "; idle hours cost money and commit nothing, which is the point. "
       + "sysbench loads its tables with autocommitted bulk inserts, which do not "
       + "increment the commit counter, so that work shows up as rows inserted in the "
       + "table view rather than here. Prices converted at one dated rate table, as of "
@@ -1526,7 +1719,9 @@ TEMPLATE = r"""<!DOCTYPE html>
     var t = tableShell(host, "Every transaction the database host committed over the "
       + "whole campaign, per USD billed for running it, split between the measured runs and "
       + "everything else the host did. InnoDB rows inserted is carried because "
-      + "sysbench's autocommitted data load moves that counter and not the commit one.");
+      + "sysbench's autocommitted data load moves that counter and not the commit one."
+      + " The Per USD column is shaded by rank, green best to red worst; the other "
+      + "columns are inputs to it, not verdicts, so they are left plain.");
     var thead = el("thead"), hr = el("tr");
     ["Provider", "Cost", "Sessions", "Host hours", "Transactions", "In runs",
      "Builds and idle", "InnoDB rows inserted", "Per USD"].forEach(function (h) {
@@ -1535,6 +1730,8 @@ TEMPLATE = r"""<!DOCTYPE html>
     thead.appendChild(hr);
     t.appendChild(thead);
     var tb = el("tbody");
+    var perUsd = cost.providers.filter(function (p) { return p.perUsd; })
+      .map(function (p) { return p.perUsd; });
     cost.providers.slice().sort(function (a, b) {
       return (b.perUsd || -1) - (a.perUsd || -1);
     }).forEach(function (p) {
@@ -1560,7 +1757,9 @@ TEMPLATE = r"""<!DOCTYPE html>
       tr.appendChild(ir);
       tr.appendChild(el("td", null, fmt(p.setup)));
       tr.appendChild(el("td", null, fmt(p.rows)));
-      tr.appendChild(el("td", null, p.perUsd ? fmtc(p.perUsd) : "-"));
+      var pu = el("td", null, p.perUsd ? fmtc(p.perUsd) : "-");
+      if (p.perUsd) shade(pu, perUsd, p.perUsd, true, "on transactions per USD");
+      tr.appendChild(pu);
       tb.appendChild(tr);
     });
     t.appendChild(tb);
@@ -1673,8 +1872,12 @@ TEMPLATE = r"""<!DOCTYPE html>
     });
     var picked = 0;
     sizes.forEach(function (o, i) { if (o.value === state.dataset) picked = i; });
-    segmented(filters, "Data set", sizes,
-      function (v) { state.dataset = v; rerender(); }, picked);
+    segmented(filters, "Data set", sizes, function (v) {
+      state.dataset = v;
+      pinSize(bench, v);
+      rerender();
+      reveal(sec);
+    }, picked);
     segmented(filters, "Runs", [
       { label: "Average", value: "average" },
       { label: "Individual", value: "individual" },

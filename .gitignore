@@ -1,2 +1,5 @@
 results/
+analysis/
 pwd.txt
+__pycache__/
+*.tar.gz

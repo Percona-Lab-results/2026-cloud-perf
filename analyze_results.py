@@ -895,7 +895,7 @@ BENCH_SPEC = {
         title="sysbench oltp_read_write - throughput",
         sub="Managed MySQL, 10 tables; mean of the measured 20 min window across runs, band = min-max",
         peak_title="sysbench oltp_read_write - peak throughput",
-        peak_sub="Best thread level per provider, at the data-set size named below",
+        peak_sub="Best thread level per provider, at the selected data-set size",
         table="summary_sysbench_tps.csv",
         # Latency spans two orders of magnitude across providers, so the axis is
         # logarithmic; on a linear one the fast five collapse into the baseline.
@@ -912,7 +912,7 @@ BENCH_SPEC = {
         title="HammerDB TPC-C - throughput",
         sub="Managed MySQL; mean of the measured 20 min window across runs, band = min-max",
         peak_title="HammerDB TPC-C - peak throughput",
-        peak_sub="Best virtual-user level per provider, at the warehouse count named below",
+        peak_sub="Best virtual-user level per provider, at the selected warehouse count",
         table="summary_hammerdb_nopm.csv",
         p95_metric="New-Order p95 latency (ms, log scale) - lower is better",
         p95_title="HammerDB TPC-C - 95th percentile New-Order latency",
