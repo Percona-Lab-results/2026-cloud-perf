@@ -19,6 +19,13 @@ Which table views are open travels in the URL too, as one "tables" key listing
 them - index.html?hammerdb=640&tables=hammerdb-peak,cost, or tables=all for every
 one - so a link can hand someone the numbers instead of the picture.
 
+A "go" key names the figure to land on, so a link opens at the chart being
+discussed rather than at the top of the page - index.html?hammerdb=320&go=peak
+or index.html?go=sysbench-latency.  It takes the words a reader would type
+(peak/best, latency/p95, throughput/tps/nopm, cost), the benchmark prefix is
+optional when a size key already names one, and every figure also carries a
+plain id (#fig-sysbench-peak, #sec-cost) for an ordinary fragment link.
+
 Called by analyze_results.py; the data contract is build_payload() below.
 """
 from __future__ import annotations
@@ -266,6 +273,9 @@ TEMPLATE = r"""<!DOCTYPE html>
   button[aria-expanded="true"] { color: var(--text-primary); border-color: var(--axis); }
 
   section.bench { margin-top: 44px; }
+  /* Anything the URL can land on keeps a little air above it, so a figure
+     scrolled to does not sit jammed against the top of the window. */
+  section.bench, figure.card { scroll-margin-top: 18px; }
   h2 {
     margin: 0 0 4px; font-size: 19px; font-weight: 650;
     padding-bottom: 10px; border-bottom: 1px solid var(--border);
@@ -734,6 +744,55 @@ TEMPLATE = r"""<!DOCTYPE html>
     return String(value);
   }
 
+  // A figure can be named in the URL as well as a size, so a link lands on the
+  // chart being discussed instead of at the top of a long page:
+  //
+  //   index.html?hammerdb=320&go=peak
+  //   index.html?go=sysbench-latency
+  //
+  // The words a reader would actually type are accepted, not just the internal
+  // slugs - "latency" and "p95" are the same chart, "peak" and "best" the same
+  // bars. A bare name takes the benchmark the link already pins a size for, so
+  // ?sysbench=40&go=peak needs no second mention of sysbench; a bare benchmark
+  // key lands on that whole section.
+  var GO_PART = {
+    throughput: "throughput", scaling: "throughput", tps: "throughput",
+    nopm: "throughput", sweep: "throughput",
+    peak: "peak", best: "peak", top: "peak",
+    latency: "p95", p95: "p95", tail: "p95",
+    cost: "cost", efficiency: "cost", usd: "cost",
+  };
+
+  // The element id a "go" value names, or null if it names nothing here. Ids
+  // are minted by tableToggle (figures) and the boot loop (sections).
+  function goTarget(token) {
+    if (token === null || token === undefined) return null;
+    var want = String(token).trim().toLowerCase().replace(/[\s_]+/g, "-");
+    if (!want) return null;
+    var bench = null;
+    DATA.benches.forEach(function (b) {
+      if (bench !== null) return;
+      if (want === b.key) { bench = b.key; want = ""; }
+      else if (want.indexOf(b.key + "-") === 0) {
+        bench = b.key;
+        want = want.slice(b.key.length + 1);
+      }
+    });
+    if (!want) return bench === null ? null : "sec-" + bench;
+    var part = GO_PART[want];
+    if (!part) return null;
+    if (part === "cost") return "fig-cost";
+    if (bench === null) {
+      // No benchmark named: the size key in the link says which section this
+      // reader is already looking at, and failing that the first one.
+      DATA.benches.forEach(function (b) {
+        if (bench === null && (b.key in QUERY)) bench = b.key;
+      });
+      if (bench === null && DATA.benches.length) bench = DATA.benches[0].key;
+    }
+    return bench === null ? null : "fig-" + bench + "-" + part;
+  }
+
   // Picking a size rewrites the address bar, so whatever the reader is looking
   // at is the thing they copy out of it. replaceState rather than pushState:
   // the chips are a lens on one page, and filling the back button with a step
@@ -746,6 +805,13 @@ TEMPLATE = r"""<!DOCTYPE html>
   function pinSize(bench, value) {
     DATA.benches.forEach(function (b) { delete QUERY[b.key]; });
     QUERY[bench.key] = shortSize(value);
+    // The click scrolls to this section, so a scroll target left over from
+    // another one would describe a page the reader is no longer on.
+    var target = "go" in QUERY ? goTarget(QUERY.go) : null;
+    if (target !== null && target.indexOf("fig-" + bench.key + "-") !== 0
+        && target !== "sec-" + bench.key) {
+      delete QUERY.go;
+    }
     pushQuery();
   }
 
@@ -1393,6 +1459,11 @@ TEMPLATE = r"""<!DOCTYPE html>
 
   function tableToggle(btn, wrap, slug) {
     wrap.id = "tableview-" + slug;
+    // The figure takes the same slug as its id, so the URL's scroll target and
+    // the table's id are one name said twice rather than two lists to keep in
+    // step. Every figure on the page has a table, so every figure gets an id.
+    var card = wrap.closest ? wrap.closest("figure") : null;
+    if (card && !card.id) card.id = "fig-" + slug;
     btn.setAttribute("aria-controls", wrap.id);
     function set(open) {
       wrap.setAttribute("data-open", open ? "1" : "0");
@@ -1851,6 +1922,7 @@ TEMPLATE = r"""<!DOCTYPE html>
   var host = document.getElementById("benches");
   DATA.benches.forEach(function (bench) {
     var sec = el("section", "bench");
+    sec.id = "sec-" + bench.key;
     sec.appendChild(el("h2", null, bench.title));
 
     // One control row above both charts in the section; they re-render against
@@ -1905,6 +1977,7 @@ TEMPLATE = r"""<!DOCTYPE html>
 
   var costHost = document.getElementById("cost");
   var costSec = el("section", "bench");
+  costSec.id = "sec-cost";
   costSec.appendChild(el("h2", null, "Cost efficiency"));
   costSec.appendChild(costFigure());
   costHost.appendChild(costSec);
@@ -1936,6 +2009,28 @@ TEMPLATE = r"""<!DOCTYPE html>
   window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", function () {
     if (root.getAttribute("data-theme") === "auto") applyTheme("auto");
   });
+
+  // Last, because scrolling is only meaningful once every chart has taken its
+  // height: the theme pass re-renders on the next frame, so the jump waits for
+  // the frame after that.
+  if ("go" in QUERY) {
+    var goId = goTarget(QUERY.go);
+    var goNode = goId === null ? null : document.getElementById(goId);
+    if (goNode) {
+      requestAnimationFrame(function () {
+        requestAnimationFrame(function () { reveal(goNode); });
+      });
+    } else if (window.console && console.warn) {
+      // Said out loud rather than silently ignored, the same as a size that
+      // does not exist: a link naming a chart this report does not hold is a
+      // broken link, not a preference.
+      console.warn("nothing on this page matches ?go="
+        + JSON.stringify(String(QUERY.go)) + "; try "
+        + Object.keys(GO_PART).join(", ")
+        + ", optionally prefixed with "
+        + DATA.benches.map(function (b) { return b.key; }).join(" or "));
+    }
+  }
 })();
 </script>
 </body>

@@ -44,7 +44,7 @@ import matplotlib.ticker as mticker
 import numpy as np
 from matplotlib.lines import Line2D
 from matplotlib.path import Path as MPath
-from matplotlib.patches import PathPatch
+from matplotlib.patches import PathPatch, Rectangle
 
 import html_report
 
@@ -464,32 +464,6 @@ def px_to_data(ax, px: float, axis: str = "x") -> float:
     return abs(inv.transform((o[0], o[1] + px))[1] - inv.transform(o)[1])
 
 
-def rounded_bar(ax, x: float, width: float, height: float, color: str,
-                radius_px: float = 4.0):
-    """A column with a 4px rounded cap, square at the baseline."""
-    if height <= 0:
-        return
-    rx = min(px_to_data(ax, radius_px, "x"), width / 2)
-    ry = min(px_to_data(ax, radius_px, "y"), height)
-    left, right, top = x - width / 2, x + width / 2, height
-    k = 0.5523  # circular-arc control-point factor
-    verts = [
-        (left, 0), (left, top - ry),
-        (left, top - ry + ry * k), (left + rx - rx * k, top), (left + rx, top),
-        (right - rx, top),
-        (right - rx + rx * k, top), (right, top - ry + ry * k), (right, top - ry),
-        (right, 0), (left, 0),
-    ]
-    codes = [MPath.MOVETO, MPath.LINETO,
-             MPath.CURVE4, MPath.CURVE4, MPath.CURVE4,
-             MPath.LINETO,
-             MPath.CURVE4, MPath.CURVE4, MPath.CURVE4,
-             MPath.LINETO, MPath.CLOSEPOLY]
-    patch = PathPatch(MPath(verts, codes), facecolor=color, edgecolor="none", zorder=3)
-    ax.add_patch(patch)
-    return patch
-
-
 def rounded_barh(ax, y: float, height: float, length: float, color: str,
                  radius_px: float = 4.0):
     """The same bar on its side: 4px rounded data-end, square at the baseline."""
@@ -598,26 +572,36 @@ def chart_scaling(agg: Agg, mode: str, out: Path, metric: str, conc_label: str,
 
 def chart_peak(agg: Agg, mode: str, out: Path, metric: str, conc_short: str,
                title: str, subtitle: str, dataset: int) -> Path:
-    """Peak throughput per provider at one data-set size, one bar per provider."""
+    """Peak throughput per provider at one data-set size, one bar per provider.
+
+    A ranking of named categories, so the bars run sideways with the names on
+    the axis and no legend - the same figure the HTML page draws, so a reader
+    who has seen one recognises the other.  Every bar carries its value, the
+    level that reached it and the spread of the runs behind it.
+    """
     t = style(mode)
     colors = SERIES[mode]
+    # Hue follows the provider, never the rank, so sorting cannot repaint anyone.
+    slot = {p: colors[i % len(colors)] for i, p in enumerate(agg.providers)}
+    rows = sorted(((agg.peak(p, dataset), p) for p in agg.providers),
+                  key=lambda r: (r[0][0] is not None, r[0][0] or 0), reverse=True)
     # Only the gaps that apply to the size this file is about.
     gaps = [g for g in agg.incomplete() if g[1] == dataset]
-    # Sized to the content: six 24px bars need very little width, and the only
-    # thing here that wants more is the title.
-    fig, ax = plt.subplots(figsize=(5.6, 5.3 if gaps else 5.0))
-    chrome(ax, t, metric)
 
-    peaks = {(0, i): agg.peak(p, dataset) for i, p in enumerate(agg.providers)}
+    fig, ax = plt.subplots(figsize=(8.6, 0.66 * len(rows) + (3.0 if gaps else 2.3)))
+    chrome(ax, t, metric, orient="h")
+
     # Scaled to the largest bar across *all* sizes, not just this one, so the
     # three files of a benchmark stay comparable bar-for-bar.
-    ymax = max((agg.peak(p, d)[0] or 0.0
+    xmax = max((agg.peak(p, d)[0] or 0.0
                 for p in agg.providers for d in agg.datasets), default=1.0)
-
-    ax.set_xticks([0], [label_dataset(agg.bench, dataset)])
-    ax.tick_params(axis="x", labelcolor=t["secondary"], labelsize=10)
-    ax.set_xlim(-0.55, 0.55)
-    ax.set_ylim(0, ymax * 1.16)
+    ax.set_yticks(range(len(rows)), [pretty(p) for _v, p in rows])
+    # The pad clears the colour key that goes in beside each name below.
+    ax.tick_params(axis="y", labelcolor=t["secondary"], labelsize=10, pad=16)
+    ax.set_ylim(len(rows) - 0.5, -0.5)
+    # Provisional; the real headroom is measured off the labels once the axes
+    # box exists, because what has to fit is text, not a fraction of the panel.
+    ax.set_xlim(0, xmax * 1.30)
 
     # A peak taken over a partial sweep is not comparable with a full one.  Say
     # it rather than letting the bar imply otherwise.
@@ -628,42 +612,68 @@ def chart_peak(agg: Agg, mode: str, out: Path, metric: str, conc_short: str,
     # in half is worse than no footnote, because it reads as complete.
     lines = textwrap.wrap(note, width=int((fig.get_figwidth() - 0.3) / 0.0666)) \
         if gaps else []
-    foot = 0.055 + 0.019 * len(lines)
+    foot = 0.012 + 0.0175 * len(lines)
 
     # Bar geometry is sized in display pixels, so the final axes box has to be
     # settled first - both the limits and the layout feed that transform.
     titles(fig, title, subtitle, t)
-    # Six entries do not fit one row at this width, so two rows of three - and
-    # the plot box gives up the height for them.
-    figure_legend(fig, agg.providers, colors, t,
-                  y=foot - 0.045 if gaps else 0.005, ncol=3)
-    fig.tight_layout(rect=(0.0, foot + 0.105 if gaps else 0.115, 1.0, 0.88))
+    fig.tight_layout(rect=(0.0, foot + 0.06, 1.0, 0.87))
     if lines:
         fig.text(0.012, 0.010, "\n".join(lines), ha="left", va="bottom",
                  fontsize=8, color=t["muted"], linespacing=1.5)
     fig.canvas.draw()
 
-    n = len(agg.providers)
-    gap = px_to_data(ax, 2.0)               # 2px surface gap between neighbours
-    # Bars are capped at 24px and never fill the slot - the leftover is air.
-    bar_w = min(0.80 / n - gap, px_to_data(ax, 24.0))
-    pitch = bar_w + gap
+    detail = {}
+    for (_v, at), provider in rows:
+        line = f"{conc_short}={at}"
+        cell = agg.stats.get((provider, dataset, at))
+        if cell:
+            _mean, lo, hi, runs = cell
+            line += f"  ·  {lo:,.0f}–{hi:,.0f} / n={runs}"
+        detail[provider] = line
 
-    for (g, i), (value, at) in peaks.items():
+    def text_px(s: str, size: float, weight: str = "normal") -> float:
+        probe = ax.text(0, 0, s, fontsize=size, fontweight=weight)
+        width = probe.get_window_extent(renderer=fig.canvas.get_renderer()).width
+        probe.remove()
+        return width
+
+    # The value and its detail line hang off the bar tip, so the panel has to
+    # hold the widest of them.  A fixed multiplier only guesses: it clipped the
+    # longest run range ("58,217-59,077 / n=3") and would waste a third of the
+    # panel when every range is short.  Reserve what the text actually needs.
+    widest = max(text_px("no data", 9) if value is None
+                 else max(text_px(f"{value:,.0f}", 10, "semibold"),
+                          text_px(detail[provider], 8))
+                 for (value, _at), provider in rows)
+    panel = ax.get_window_extent().width
+    ax.set_xlim(0, xmax * panel / max(panel - (12.0 + widest + 6.0), 40.0))
+    fig.canvas.draw()
+
+    bar_h = min(0.62, px_to_data(ax, 24.0, "y"))
+    sw = px_to_data(ax, 9.0)                       # the 9px key beside the name
+    halo = [pe.withStroke(linewidth=2.5, foreground=t["surface"])]
+    for i, ((value, at), provider) in enumerate(rows):
+        # Identity comes from a key beside the name, never from colouring the
+        # text itself - the same arrangement as the HTML.
+        ax.add_patch(Rectangle((-sw, i - px_to_data(ax, 4.5, "y")),
+                               sw, px_to_data(ax, 9.0, "y"),
+                               facecolor=slot[provider], edgecolor="none",
+                               clip_on=False, zorder=4))
         if value is None:
+            ax.text(px_to_data(ax, 12.0), i, "no data", va="center",
+                    fontsize=9, color=t["muted"])
             continue
-        x = g + (i - (n - 1) / 2) * pitch
-        rounded_bar(ax, x, bar_w, value, colors[i])
-        # Label selectively: only the leader of each group, which is the one the
-        # chart is about. Every value stays in the table view, so nothing is
-        # gated - that is also the relief for the light-mode slots under 3:1.
-        leader = max((v[0] for (gg, _), v in peaks.items()
-                      if gg == g and v[0] is not None), default=None)
-        if value == leader:
-            ax.annotate(f"{value:,.0f}\n{conc_short}={at}",
-                        (x, value), textcoords="offset points", xytext=(0, 6),
-                        ha="center", va="bottom", fontsize=8.5,
-                        color=t["secondary"], linespacing=1.3, zorder=5)
+        rounded_barh(ax, i, bar_h, value, slot[provider])
+        # Bars -> value at the tip, outside the bar end so it is never clipped.
+        # The labels sit out in the gridded field, so each carries a 2px surface
+        # halo - otherwise a gridline runs straight through the digits.
+        tx = value + px_to_data(ax, 12.0)
+        ax.text(tx, i - px_to_data(ax, 5.0, "y"), f"{value:,.0f}", va="center",
+                fontsize=10, fontweight="semibold", color=t["primary"],
+                path_effects=halo)
+        ax.text(tx, i + px_to_data(ax, 8.0, "y"), detail[provider], va="center",
+                fontsize=8, color=t["muted"], path_effects=halo)
 
     fig.savefig(out)
     plt.close(fig)
