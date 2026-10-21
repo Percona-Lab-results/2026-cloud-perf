@@ -9,6 +9,10 @@ readout for every provider, the ranked bars carry a per-row tooltip, and every
 figure has a table view beside it.  There is no CDN dependency - the file works
 offline and can be copied anywhere.
 
+Each benchmark section also reads its data-set size from the URL, one query key
+per benchmark - index.html?sysbench=40&hammerdb=320 - so a link can point at the
+slice being discussed instead of describing which buttons to press.
+
 Called by analyze_results.py; the data contract is build_payload() below.
 """
 from __future__ import annotations
@@ -24,13 +28,9 @@ SERIES_DARK = ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#008300"]
 MARKERS = ["circle", "square", "triangle", "diamond", "triangleDown", "plus"]
 
 
-def txn_word(bench: str) -> str:
-    """What one counted unit of work is called in this benchmark."""
-    return "transactions" if bench == "sysbench" else "TPC-C transactions"
-
-
-def build_payload(aggs: dict, sessions: list, root: Path, specs: dict,
-                  pretty, label_dataset, cost_usd, cost_native, fx: dict) -> dict:
+def build_payload(aggs: dict, lats: dict, sessions: list, work, root: Path,
+                  specs: dict, cost_spec: dict, pretty, label_dataset,
+                  cost_usd, cost_native, fx: dict) -> dict:
     """Shape the Agg objects into the JSON the page's renderer consumes."""
     payload = {
         "generated": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
@@ -43,36 +43,32 @@ def build_payload(aggs: dict, sessions: list, root: Path, specs: dict,
             "bench": s.bench, "rows": len(s.rows), "dropped": s.dropped,
             "dir": s.path.name,
         } for s in sessions],
+        # Cost efficiency is one measure for the whole host, so it sits beside
+        # the benchmark sections rather than inside either of them.
+        "cost": {
+            "title": cost_spec["title"],
+            "sub": cost_spec["sub"],
+            "providers": [dict({
+                "key": p, "name": pretty(p),
+                "light": SERIES_LIGHT[i % len(SERIES_LIGHT)],
+                "dark": SERIES_DARK[i % len(SERIES_DARK)],
+                "marker": MARKERS[i % len(MARKERS)],
+                "perUsd": work.per_usd(p),
+            }, **_campaign(work.total(p)), **_price(p, cost_usd, cost_native))
+                for i, p in enumerate(work.providers)],
+            "skipped": [{"name": r["name"], "why": r["why"]} for r in work.skipped],
+        },
         "benches": [],
     }
     for bench, agg in aggs.items():
         spec = specs[bench]
-        cells = {}
-        for (provider, dataset, conc), (mean, lo, hi, runs) in agg.stats.items():
-            if provider not in agg.providers:
-                continue
-            cells[f"{provider}|{dataset}|{conc}"] = {
-                "mean": round(mean, 2), "min": round(lo, 2),
-                "max": round(hi, 2), "runs": runs,
-                # The individual runs behind the mean, in run order.
-                "vals": [[r, round(v, 2)] for r, v in
-                         agg.runs.get((provider, dataset, conc), [])],
-            }
+        cells = _cells(agg, agg.providers)
         peaks = {}
-        # Work done, summed over every concurrency level and every run: the
-        # basis of cost efficiency.  Keyed by data-set size, plus "all".
-        totals = {}
         for provider in agg.providers:
             for dataset in agg.datasets:
                 value, at = agg.peak(provider, dataset)
                 if value is not None:
                     peaks[f"{provider}|{dataset}"] = {"value": round(value, 2), "at": at}
-            for dataset in list(agg.datasets) + [None]:
-                txn, nord, count = agg.total(provider, dataset)
-                if txn:
-                    totals[f"{provider}|{'all' if dataset is None else dataset}"] = {
-                        "txn": round(txn), "nord": round(nord), "n": count,
-                    }
         payload["benches"].append({
             "key": bench,
             "title": spec["title"].split(" - ")[0],
@@ -86,8 +82,6 @@ def build_payload(aggs: dict, sessions: list, root: Path, specs: dict,
             "peakSub": spec["peak_sub"],
             "datasetCol": spec["dataset_col"],
             "concCol": spec["conc_col"],
-            "effTitle": spec["eff_title"],
-            "effSub": spec["eff_sub"],
             "providers": [dict({
                 "key": p, "name": pretty(p),
                 "light": SERIES_LIGHT[i], "dark": SERIES_DARK[i],
@@ -98,13 +92,65 @@ def build_payload(aggs: dict, sessions: list, root: Path, specs: dict,
             "concurrency": agg.concurrency,
             "cells": cells,
             "peaks": peaks,
-            "totals": totals,
-            "txnWord": txn_word(bench),
             "incomplete": [{"provider": p, "name": pretty(p), "dataset": d,
                             "datasetLabel": label_dataset(bench, d), "have": have}
                            for p, d, have in agg.incomplete()],
+            # The latency view of the same sweep: its own cells and axis, but
+            # the section's data-set and average/individual controls drive both.
+            "p95": _latency_view(lats.get(bench), agg, spec),
         })
     return payload
+
+
+def _cells(agg, providers: list) -> dict:
+    """The (provider, dataset, concurrency) grid the renderer indexes into."""
+    cells = {}
+    for (provider, dataset, conc), (mean, lo, hi, runs) in agg.stats.items():
+        if provider not in providers:
+            continue
+        cells[f"{provider}|{dataset}|{conc}"] = {
+            "mean": round(mean, 2), "min": round(lo, 2),
+            "max": round(hi, 2), "runs": runs,
+            # The individual runs behind the mean, in run order.
+            "vals": [[r, round(v, 2)] for r, v in
+                     agg.runs.get((provider, dataset, conc), [])],
+        }
+    return cells
+
+
+def _latency_view(lat, agg, spec: dict) -> dict | None:
+    """p95 for the same providers as the throughput chart, or None if a
+    benchmark has no latency at all - a missing figure beats an empty one."""
+    if lat is None or not lat.stats:
+        return None
+    cells = _cells(lat, agg.providers)
+    if not cells:
+        return None
+    return {
+        "metric": "p95",
+        "metricLong": spec["p95_metric"],
+        "title": spec["p95_title"],
+        "sub": spec["p95_sub"],
+        "table": spec["p95_table"],
+        "concurrency": lat.concurrency,
+        "cells": cells,
+        # What this percentile does and does not cover; the two benchmarks
+        # differ on that, so it is stated next to each chart.
+        "note": spec["p95_note"],
+        # Rows that have throughput but no percentile; said out loud rather
+        # than silently thinning the lines.
+        "missing": lat.missing,
+    }
+
+
+def _campaign(total: dict) -> dict:
+    """One provider's whole campaign, named the way the page reads it."""
+    return {
+        "txn": total["txn"], "inRuns": total["in_run"], "setup": total["setup"],
+        "runs": total["runs"], "sessionCount": total["sessions"],
+        "hours": round(total["hours"], 1), "queries": total["queries"],
+        "rows": total["rows"], "benches": total["benches"],
+    }
 
 
 def _price(provider: str, cost_usd, cost_native) -> dict:
@@ -307,13 +353,17 @@ TEMPLATE = r"""<!DOCTYPE html>
   <header class="page">
     <div class="grow">
       <h1>Managed MySQL cloud performance</h1>
-      <p class="sub">sysbench <code>oltp_read_write</code> throughput (TPS) and HammerDB TPC-C throughput (NOPM) across cloud providers, and what each provider's throughput costs per dollar.</p>
+      <p class="sub">sysbench <code>oltp_read_write</code> throughput (TPS) and HammerDB TPC-C throughput (NOPM) across cloud providers, the 95th-percentile latency each sustained while delivering it, and how many transactions each provider's database host committed per dollar billed for running it.</p>
       <p class="meta" id="meta"></p>
     </div>
     <button id="theme-toggle" type="button" aria-live="polite">Theme</button>
   </header>
 
   <div id="benches"></div>
+
+  <!-- Cost efficiency is one measure for the whole host, not one per
+       benchmark, so it sits on its own rather than inside either section. -->
+  <div id="cost"></div>
 
   <section class="inventory">
     <h2>Instance cost</h2>
@@ -425,6 +475,28 @@ TEMPLATE = r"""<!DOCTYPE html>
     return { ticks: out, top: best.niceMax };
   }
 
+  // Latency spans two orders of magnitude across these providers, so its axis
+  // is logarithmic - on a linear one the fast providers collapse onto the
+  // baseline and only the slowest is readable. 1-2-5 per decade, with the frame
+  // snapped out to the next step past the data so no point sits on the edge.
+  function logTicks(lo, hi) {
+    lo = Math.max(lo, 1e-6);
+    hi = Math.max(hi, lo * 1.001);
+    var all = [];
+    for (var e = Math.floor(Math.log10(lo)) - 1; e <= Math.ceil(Math.log10(hi)); e++) {
+      [1, 2, 5].forEach(function (f) { all.push(f * Math.pow(10, e)); });
+    }
+    var bottom = all[0], top = all[all.length - 1];
+    all.forEach(function (t) {
+      if (t <= lo) bottom = Math.max(bottom, t);
+    });
+    for (var i = all.length - 1; i >= 0; i--) if (all[i] >= hi) top = all[i];
+    return {
+      ticks: all.filter(function (t) { return t >= bottom && t <= top; }),
+      bottom: bottom, top: top,
+    };
+  }
+
   var MARKER_R = 4.2;   // >= 8px mark
   // The individual-runs view draws three times as many marks, so it asks for a
   // smaller r; the hit target there is the column crosshair, not the mark.
@@ -497,7 +569,11 @@ TEMPLATE = r"""<!DOCTYPE html>
   }
 
   // One labelled segmented control; single-select, arrow-key navigable.
-  function segmented(host, label, options, onPick) {
+  // `initial` is the index that starts selected - the caller has already put the
+  // matching value in its own state, so this only sets the chip, and onPick is
+  // not fired at boot.
+  function segmented(host, label, options, onPick, initial) {
+    var start = initial > 0 && initial < options.length ? initial : 0;
     var group = el("div", "filter-group");
     group.appendChild(el("span", "filter-label", label));
     var seg = el("div", "segmented");
@@ -507,8 +583,8 @@ TEMPLATE = r"""<!DOCTYPE html>
       var b = el("button", null, o.label);
       b.type = "button";
       b.setAttribute("role", "radio");
-      b.setAttribute("aria-checked", i === 0 ? "true" : "false");
-      b.tabIndex = i === 0 ? 0 : -1;
+      b.setAttribute("aria-checked", i === start ? "true" : "false");
+      b.tabIndex = i === start ? 0 : -1;
       seg.appendChild(b);
       return b;
     });
@@ -537,6 +613,67 @@ TEMPLATE = r"""<!DOCTYPE html>
       if (bench.datasets[i].value === value) return bench.datasets[i];
     }
     return bench.datasets[0];
+  }
+
+  // A data-set size can be pinned in the URL, one key per benchmark, so a
+  // particular slice is linkable rather than something the reader has to be
+  // told to click:
+  //
+  //   index.html?sysbench=40&hammerdb=320
+  //
+  // Read once at boot, then the controls own the state.
+  var QUERY = (function () {
+    var out = {};
+    try {
+      new URLSearchParams(window.location.search).forEach(function (v, k) {
+        out[k.trim().toLowerCase()] = v;
+      });
+    } catch (e) { /* no URL API: the defaults stand */ }
+    return out;
+  })();
+
+  // Which of a benchmark's data sets a URL value names, or null for none. The
+  // short form each benchmark is spoken in is accepted alongside the raw value,
+  // because the number in a query string is typed by a person: for sysbench
+  // 40, 40m, 40M and 40000000 all name the same data set, and for HammerDB the
+  // warehouse count is already the short form.
+  function datasetFromToken(bench, token) {
+    if (token === null || token === undefined) return null;
+    var want = String(token).trim().toLowerCase().replace(/[\s,_]/g, "");
+    if (!want) return null;
+    for (var i = 0; i < bench.datasets.length; i++) {
+      var d = bench.datasets[i];
+      var label = d.label.toLowerCase().replace(/[\s,_]/g, "");
+      var cands = [String(d.value), label];
+      if (d.value >= 1e6 && d.value % 1e6 === 0) {
+        cands.push(String(d.value / 1e6));
+        cands.push(String(d.value / 1e6) + "m");
+      }
+      for (var j = 0; j < cands.length; j++) {
+        if (cands[j] === want) return d.value;
+      }
+      // "40mrows" against "40mrows/table". Only a token carrying a letter may
+      // match on a prefix: a bare number must be exact, or ?hammerdb=32 would
+      // quietly land on 320 warehouses instead of saying it found nothing.
+      if (/[a-z]/.test(want) && label.indexOf(want) === 0) return d.value;
+    }
+    return null;
+  }
+
+  function initialDataset(bench) {
+    var fallback = bench.datasets.length ? bench.datasets[0].value : null;
+    if (!(bench.key in QUERY)) return fallback;
+    var hit = datasetFromToken(bench, QUERY[bench.key]);
+    if (hit !== null) return hit;
+    // Said out loud rather than silently ignored: a link naming a size this
+    // report does not hold is a broken link, not a preference.
+    if (window.console && console.warn) {
+      console.warn("no " + bench.key + " data set matches "
+        + JSON.stringify(String(QUERY[bench.key])) + "; showing "
+        + bench.datasets.map(function (d) { return d.label; }).join(", ")
+        + " - defaulted to the first");
+    }
+    return fallback;
   }
 
   // -------------------------------------------------------------- tooltip ---
@@ -572,14 +709,48 @@ TEMPLATE = r"""<!DOCTYPE html>
   }
 
   // ----------------------------------------------------------- line chart ---
+  // Two readings of the same sweep: how much work got through, and what the
+  // slow tail cost while it did. The geometry, the crosshair and the table twin
+  // are identical, so the figure takes a view that supplies the grid it reads,
+  // its axis scale and its number format - one axis each, never two on one
+  // chart. Both views answer to the section's data-set and averaging controls.
+  function throughputView(bench) {
+    return {
+      cells: bench.cells, concurrency: bench.concurrency,
+      metric: bench.metric, metricLong: bench.metricLong,
+      title: bench.scalingTitle, sub: bench.scalingSub,
+      indivSub: "One line per run over the measured 20 min window - not averaged.",
+      log: false, nf: fmt, higherIsBetter: true, note: "",
+    };
+  }
+  function latencyView(bench) {
+    var p = bench.p95;
+    if (!p) return null;
+    return {
+      cells: p.cells, concurrency: p.concurrency,
+      metric: "p95", metricLong: p.metricLong,
+      title: p.title, sub: p.sub,
+      indivSub: "One run's own p95 per line - not averaged. " + p.sub,
+      log: true, nf: fmtp, higherIsBetter: false,
+      // What the percentile covers belongs beside it, and a thinned line
+      // should say why it is thin rather than look like a provider that
+      // simply stopped scaling.
+      note: p.note + (p.missing
+        ? " " + p.missing + " measurement" + (p.missing === 1 ? "" : "s")
+          + " reported throughput but no percentile and " + (p.missing === 1 ? "is" : "are")
+          + " not plotted here."
+        : ""),
+    };
+  }
+
   // Throughput against the concurrency sweep for the selected data-set size.
-  function scalingFigure(bench, state) {
+  function scalingFigure(bench, state, view) {
     var fig = el("figure", "card");
     var cap = el("figcaption");
     var grow = el("div", "grow");
-    var titleNode = el("div", "fig-title", bench.scalingTitle);
+    var titleNode = el("div", "fig-title", view.title);
     grow.appendChild(titleNode);
-    var subNode = el("div", "fig-sub", bench.scalingSub);
+    var subNode = el("div", "fig-sub", view.sub);
     grow.appendChild(subNode);
     cap.appendChild(grow);
     var tableBtn = el("button", null, "Table view");
@@ -602,7 +773,8 @@ TEMPLATE = r"""<!DOCTYPE html>
       tableWrap.setAttribute("data-open", open ? "0" : "1");
       tableBtn.setAttribute("aria-pressed", open ? "false" : "true");
     });
-    function cell(p, d, c) { return bench.cells[p + "|" + d + "|" + c] || null; }
+    var levels = view.concurrency;
+    function cell(p, d, c) { return view.cells[p + "|" + d + "|" + c] || null; }
 
     function render() {
       plot.textContent = "";
@@ -611,10 +783,8 @@ TEMPLATE = r"""<!DOCTYPE html>
 
       var d = datasetOf(bench, state.dataset);
       var individual = state.mode === "individual";
-      titleNode.textContent = bench.scalingTitle + " - " + d.label;
-      subNode.textContent = individual
-        ? "One line per run over the measured 20 min window - not averaged."
-        : bench.scalingSub;
+      titleNode.textContent = view.title + " - " + d.label;
+      subNode.textContent = individual ? view.indivSub : view.sub;
 
       var surface = cssVar("--surface-1"), grid = cssVar("--grid"),
           axis = cssVar("--axis"), muted = cssVar("--text-muted"),
@@ -623,28 +793,35 @@ TEMPLATE = r"""<!DOCTYPE html>
 
       // The y-scale spans every data set, not just the selected one, so
       // switching the control does not silently rescale the comparison.
-      var max = 0;
+      var max = 0, min = Infinity;
       bench.providers.forEach(function (p) {
         if (hidden[p.key]) return;
         bench.datasets.forEach(function (ds) {
-          bench.concurrency.forEach(function (c) {
+          levels.forEach(function (c) {
             var v = cell(p.key, ds.value, c);
-            if (v) max = Math.max(max, v.max);
+            if (!v) return;
+            max = Math.max(max, v.max);
+            if (v.min > 0) min = Math.min(min, v.min);
           });
         });
       });
-      var scale0 = ticks(max, 6);
-      var tk = scale0.ticks, top = scale0.top;
+      var scale0 = view.log ? logTicks(min === Infinity ? 1 : min, max) : ticks(max, 6);
+      var tk = scale0.ticks, top = scale0.top, bottom = scale0.bottom || 0;
 
       var W = 1100, H = 520, M = { t: 22, r: 132, b: 58, l: 86 };
       var pw = W - M.l - M.r, ph = H - M.t - M.b;
-      var xs = bench.concurrency.map(function (_, i) {
-        return M.l + (bench.concurrency.length === 1 ? pw / 2 : (pw * i) / (bench.concurrency.length - 1));
+      var xs = levels.map(function (_, i) {
+        return M.l + (levels.length === 1 ? pw / 2 : (pw * i) / (levels.length - 1));
       });
-      function yOf(v) { return M.t + ph - (v / top) * ph; }
+      var lspan = view.log ? Math.log10(top) - Math.log10(bottom) : 0;
+      function yOf(v) {
+        if (!view.log) return M.t + ph - (v / top) * ph;
+        var q = (Math.log10(Math.max(v, bottom)) - Math.log10(bottom)) / lspan;
+        return M.t + ph - q * ph;
+      }
 
       var svg = svgEl("svg", { viewBox: "0 0 " + W + " " + H, role: "img", tabindex: "0" });
-      svg.setAttribute("aria-label", bench.scalingTitle + ", " + d.label +
+      svg.setAttribute("aria-label", view.title + ", " + d.label +
         ". Use the arrow keys to read each " + bench.concLabel.toLowerCase() + " level.");
 
       // Recessive chrome: hairline solid gridlines, no top/right frame.
@@ -656,13 +833,13 @@ TEMPLATE = r"""<!DOCTYPE html>
         var lab = svgEl("text", {
           x: M.l - 11, y: yOf(t) + 4, "text-anchor": "end", fill: muted, "font-size": 12.5,
         });
-        lab.textContent = fmt(t);
+        lab.textContent = view.nf(t);
         svg.appendChild(lab);
       });
       svg.appendChild(svgEl("line", { x1: M.l, y1: M.t, x2: M.l, y2: M.t + ph, stroke: axis, "stroke-width": 1 }));
       svg.appendChild(svgEl("line", { x1: M.l, y1: M.t + ph, x2: M.l + pw, y2: M.t + ph, stroke: axis, "stroke-width": 1 }));
 
-      bench.concurrency.forEach(function (c, i) {
+      levels.forEach(function (c, i) {
         var t = svgEl("text", { x: xs[i], y: M.t + ph + 21, "text-anchor": "middle", fill: muted, "font-size": 12.5 });
         t.textContent = c;
         svg.appendChild(t);
@@ -674,7 +851,7 @@ TEMPLATE = r"""<!DOCTYPE html>
         fill: secondary, "font-size": 13, "text-anchor": "middle",
         transform: "translate(17," + (M.t + ph / 2) + ") rotate(-90)",
       });
-      ylab.textContent = bench.metricLong;
+      ylab.textContent = view.metricLong;
       svg.appendChild(ylab);
 
       var crosshair = svgEl("line", {
@@ -688,7 +865,7 @@ TEMPLATE = r"""<!DOCTYPE html>
         if (hidden[p.key]) return;
         var color = colorOf(p);
         var pts = [];
-        bench.concurrency.forEach(function (c, i) {
+        levels.forEach(function (c, i) {
           var v = cell(p.key, d.value, c);
           if (v) pts.push({ i: i, x: xs[i], v: v });
         });
@@ -736,7 +913,7 @@ TEMPLATE = r"""<!DOCTYPE html>
         var last = pts[pts.length - 1];
         // Only a series that reaches the end of the sweep gets an end label; a
         // truncated one would drop its label mid-plot, on top of the others.
-        if (last.i === bench.concurrency.length - 1) {
+        if (last.i === levels.length - 1) {
           ends.push({ p: p, color: color, y: yOf(last.v.mean), value: last.v.mean });
         }
       });
@@ -768,14 +945,14 @@ TEMPLATE = r"""<!DOCTYPE html>
         }
         svg.appendChild(marker(e.p.marker, lx + 5, e.ly, e.color, surface));
         var t = svgEl("text", { x: lx + 16, y: e.ly + 4.5, fill: secondary, "font-size": 12.5 });
-        t.textContent = fmt(e.value);
+        t.textContent = view.nf(e.value);
         svg.appendChild(t);
       });
 
       // The crosshair finds the X: readers aim at a thread level, not a line.
       var active = -1;
       function focusAt(idx, clientX, clientY) {
-        if (idx < 0 || idx >= bench.concurrency.length) return;
+        if (idx < 0 || idx >= levels.length) return;
         active = idx;
         var box = svg.getBoundingClientRect();
         var scale = box.width / W;
@@ -785,21 +962,25 @@ TEMPLATE = r"""<!DOCTYPE html>
         var rows = [];
         bench.providers.forEach(function (p) {
           if (hidden[p.key]) return;
-          var v = cell(p.key, d.value, bench.concurrency[idx]);
+          var v = cell(p.key, d.value, levels[idx]);
           rows.push({
             color: colorOf(p), name: p.name,
-            value: v ? fmt(v.mean) : "no data",
+            value: v ? view.nf(v.mean) : "no data",
             range: !v ? "" : individual
-              ? "runs: " + (v.vals || []).map(function (rv) { return fmt(rv[1]); }).join(", ")
-              : fmt(v.min) + "\u2013" + fmt(v.max) + " over " + v.runs + " run" + (v.runs === 1 ? "" : "s"),
+              ? "runs: " + (v.vals || []).map(function (rv) { return view.nf(rv[1]); }).join(", ")
+              : view.nf(v.min) + "\u2013" + view.nf(v.max) + " over " + v.runs + " run" + (v.runs === 1 ? "" : "s"),
           });
         });
+        // Best first, which on a latency axis means smallest.
         rows.sort(function (a, b) {
-          return (parseFloat(b.value.replace(/,/g, "")) || -1) - (parseFloat(a.value.replace(/,/g, "")) || -1);
+          var av = parseFloat(a.value.replace(/,/g, "")), bv = parseFloat(b.value.replace(/,/g, ""));
+          if (isNaN(av)) return 1;
+          if (isNaN(bv)) return -1;
+          return view.higherIsBetter ? bv - av : av - bv;
         });
         var ax = clientX === undefined ? box.left + xs[idx] * scale : clientX;
         var ay = clientY === undefined ? box.top + box.height / 2 : clientY;
-        tip.show(d.label + " - " + bench.concLabel.toLowerCase() + " " + bench.concurrency[idx], rows, ax, ay);
+        tip.show(d.label + " - " + bench.concLabel.toLowerCase() + " " + levels[idx], rows, ax, ay);
       }
       function clear() {
         active = -1;
@@ -821,14 +1002,15 @@ TEMPLATE = r"""<!DOCTYPE html>
       svg.addEventListener("focus", function () { focusAt(active < 0 ? 0 : active); });
       svg.addEventListener("blur", clear);
       svg.addEventListener("keydown", function (ev) {
-        if (ev.key === "ArrowRight") { focusAt(Math.min((active < 0 ? -1 : active) + 1, bench.concurrency.length - 1)); ev.preventDefault(); }
+        if (ev.key === "ArrowRight") { focusAt(Math.min((active < 0 ? -1 : active) + 1, levels.length - 1)); ev.preventDefault(); }
         else if (ev.key === "ArrowLeft") { focusAt(Math.max((active < 0 ? 1 : active) - 1, 0)); ev.preventDefault(); }
         else if (ev.key === "Escape") { clear(); }
       });
 
       plot.appendChild(svg);
+      if (view.note) plot.appendChild(el("div", "note", view.note));
       buildLegend(legend, bench, hidden, false, render);
-      buildSweepTable(tableWrap, bench, individual);
+      buildSweepTable(tableWrap, bench, individual, view);
     }
 
     render();
@@ -840,16 +1022,13 @@ TEMPLATE = r"""<!DOCTYPE html>
   // With the data set chosen by the control this is a ranking of five named
   // categories, so it is bars with the names on the axis - no legend needed,
   // and the value rides the tip of each bar.
-  // Same ranked-bar figure for two measures: throughput, and throughput per
-  // dollar. One renderer, because the only difference is the divisor - a second
-  // copy would drift.
-  function peakFigure(bench, state, eff) {
+  function peakFigure(bench, state) {
     var fig = el("figure", "card");
     var cap = el("figcaption");
     var grow = el("div", "grow");
-    var titleNode = el("div", "fig-title", eff ? bench.effTitle : bench.peakTitle);
+    var titleNode = el("div", "fig-title", bench.peakTitle);
     grow.appendChild(titleNode);
-    var subNode = el("div", "fig-sub", eff ? bench.effSub : bench.peakSub);
+    var subNode = el("div", "fig-sub", bench.peakSub);
     grow.appendChild(subNode);
     cap.appendChild(grow);
     var tableBtn = el("button", null, "Table view");
@@ -871,43 +1050,27 @@ TEMPLATE = r"""<!DOCTYPE html>
     });
 
     function peak(p, d) { return bench.peaks[p + "|" + d] || null; }
-    function total(p, d) { return bench.totals[p + "|" + d] || null; }
 
     function render() {
       plot.textContent = "";
       tip.hide();
 
       var d = datasetOf(bench, state.dataset);
-      // A total already contains every run, so the average/individual control
-      // has nothing left to say about it.
-      var individual = !eff && state.mode === "individual";
-      var nf = eff ? fmtc : fmt;
-      titleNode.textContent = (eff ? bench.effTitle : bench.peakTitle) + " - " + d.label;
-      subNode.textContent = (eff ? bench.effSub : bench.peakSub) + (individual
-        ? " Each run marked on the bar."
-        : eff ? " Every run at this size is in the sum." : "");
+      var individual = state.mode === "individual";
+      var nf = fmt;
+      titleNode.textContent = bench.peakTitle + " - " + d.label;
+      subNode.textContent = bench.peakSub + (individual ? " Each run marked on the bar." : "");
 
       var surface = cssVar("--surface-1"), grid = cssVar("--grid"),
           axis = cssVar("--axis"), muted = cssVar("--text-muted"),
           secondary = cssVar("--text-secondary"), primary = cssVar("--text-primary");
 
-      // Two measures, one renderer. The peak bar is a rate; the cost bar is
-      // every transaction completed at this size - all concurrency levels, all
-      // runs - over what the instance cost. An unpriced provider is dropped
-      // rather than drawn at zero, which would read as "no work per dollar"
-      // instead of "price unknown".
       function peakOf(p, dsv) {
-        if (!eff) {
-          var q = peak(p.key, dsv);
-          return q ? { value: q.value, at: q.at } : null;
-        }
-        var w = total(p.key, dsv);
-        return (!w || !p.costUsd) ? null
-          : { value: w.txn / p.costUsd, at: null, raw: w.txn, n: w.n };
+        var q = peak(p.key, dsv);
+        return q ? { value: q.value, at: q.at } : null;
       }
       function detailOf(p, dsv, at) {
-        // A sum has no single concurrency level behind it, so no run detail.
-        if (eff || at === null) return null;
+        if (at === null) return null;
         var c0 = bench.cells[p.key + "|" + dsv + "|" + at];
         return !c0 ? null : {
           min: c0.min, max: c0.max, runs: c0.runs,
@@ -949,8 +1112,8 @@ TEMPLATE = r"""<!DOCTYPE html>
       function xOf(v) { return M.l + (v / top) * pw; }
 
       var svg = svgEl("svg", { viewBox: "0 0 " + W + " " + H, role: "img" });
-      svg.setAttribute("aria-label", (eff ? bench.effTitle : bench.peakTitle) + ", "
-        + d.label + ". " + (eff ? bench.effSub : bench.peakSub) + ".");
+      svg.setAttribute("aria-label", bench.peakTitle + ", " + d.label + ". "
+        + bench.peakSub + ".");
 
       tk.forEach(function (t) {
         svg.appendChild(svgEl("line", {
@@ -962,20 +1125,15 @@ TEMPLATE = r"""<!DOCTYPE html>
       });
       svg.appendChild(svgEl("line", { x1: M.l, y1: M.t, x2: M.l, y2: M.t + ph, stroke: axis, "stroke-width": 1 }));
       var xlab = svgEl("text", { x: M.l + pw / 2, y: H - 8, "text-anchor": "middle", fill: secondary, "font-size": 13 });
-      xlab.textContent = eff
-        ? bench.txnWord.charAt(0).toUpperCase() + bench.txnWord.slice(1) + " per USD of spend"
-        : bench.metricLong;
+      xlab.textContent = bench.metricLong;
       svg.appendChild(xlab);
 
       rows.forEach(function (r, i) {
         var yTop = M.t + i * PITCH, yc = yTop + PITCH / 2;
         var g = svgEl("g", { tabindex: "0", role: "img" });
         g.setAttribute("aria-label", r.p.name + ", " + d.label + ": " + (r.q
-          ? eff
-            ? nf(r.q.value) + " " + bench.txnWord + " per USD, "
-              + fmt(r.q.raw) + " over " + r.q.n + " measurements"
-            : nf(r.q.value) + " " + bench.metric + " at " + bench.concShort + "=" + r.q.at
-          : eff && !r.p.costUsd ? "not priced" : "no data"));
+          ? nf(r.q.value) + " " + bench.metric + " at " + bench.concShort + "=" + r.q.at
+          : "no data"));
 
         var name = svgEl("text", { x: M.l - 14, y: yc + 4.5, "text-anchor": "end", fill: secondary, "font-size": 13 });
         name.textContent = r.p.name;
@@ -988,7 +1146,7 @@ TEMPLATE = r"""<!DOCTYPE html>
 
         if (!r.q) {
           var none = svgEl("text", { x: M.l + 12, y: yc + 4.5, fill: muted, "font-size": 12.5 });
-          none.textContent = eff && !r.p.costUsd ? "not priced" : "no data";
+          none.textContent = "no data";
           g.appendChild(none);
           svg.appendChild(g);
           return;
@@ -1012,14 +1170,9 @@ TEMPLATE = r"""<!DOCTYPE html>
         v1.textContent = nf(r.q.value);
         g.appendChild(v1);
         var v2 = svgEl("text", { x: tipX, y: yc + 12, fill: muted, "font-size": 10.5 });
-        // In cost mode the second line carries the two numbers the ratio came
-        // from, so the bar is never an unexplained quotient.
-        v2.textContent = eff
-          ? fmtc(r.q.raw) + " " + bench.txnWord + " / " + usd(r.p.costUsd)
-            + "  \u00b7  n=" + r.q.n
-          : bench.concShort + "=" + r.q.at + (!at ? "" : individual
-            ? "  \u00b7  " + at.vals.map(function (rv) { return fmt(rv); }).join("  \u00b7  ")
-            : "  \u00b7  " + fmt(at.min) + "\u2013" + fmt(at.max) + " / n=" + at.runs);
+        v2.textContent = bench.concShort + "=" + r.q.at + (!at ? "" : individual
+          ? "  \u00b7  " + at.vals.map(function (rv) { return fmt(rv); }).join("  \u00b7  ")
+          : "  \u00b7  " + fmt(at.min) + "\u2013" + fmt(at.max) + " / n=" + at.runs);
         g.appendChild(v2);
 
         // The bar is the mean; in individual mode each run that went into it is
@@ -1041,14 +1194,9 @@ TEMPLATE = r"""<!DOCTYPE html>
           var c0 = at;
           tip.show(r.p.name + " - " + d.label, [{
             color: color,
-            name: eff ? bench.txnWord + " per USD of spend"
-                      : bench.metric + " at " + bench.concShort + "=" + r.q.at,
+            name: bench.metric + " at " + bench.concShort + "=" + r.q.at,
             value: nf(r.q.value),
-            range: eff
-              ? fmt(r.q.raw) + " " + bench.txnWord + " over " + r.q.n
-                + " measurements / " + usd(r.p.costUsd) + " ("
-                + r.p.costNative + " " + r.p.costCurrency + ")"
-              : !c0 ? "" : individual
+            range: !c0 ? "" : individual
                 ? "runs: " + c0.vals.map(function (rv) { return fmt(rv); }).join(", ")
                 : fmt(c0.min) + "\u2013" + fmt(c0.max) + " over " + c0.runs +
                   " run" + (c0.runs === 1 ? "" : "s"),
@@ -1068,7 +1216,7 @@ TEMPLATE = r"""<!DOCTYPE html>
       });
 
       plot.appendChild(svg);
-      buildPeakTable(tableWrap, bench, eff);
+      buildPeakTable(tableWrap, bench);
     }
 
     render();
@@ -1114,14 +1262,15 @@ TEMPLATE = r"""<!DOCTYPE html>
     return td;
   }
 
-  function buildSweepTable(host, bench, individual) {
-    var t = tableShell(host, bench.metricLong + " - mean across runs, with "
+  function buildSweepTable(host, bench, individual, view) {
+    var nf = view.nf, levels = view.concurrency;
+    var t = tableShell(host, view.metricLong + " - mean across runs, with "
       + (individual ? "each run's own value" : "the min-max range") + ". "
       + "Every data set, not just the selected one, so the controls never hide a value.");
     var thead = el("thead"), hr = el("tr");
     hr.appendChild(el("th", null, "Provider"));
     hr.appendChild(el("th", null, "Data set"));
-    bench.concurrency.forEach(function (c) {
+    levels.forEach(function (c) {
       hr.appendChild(el("th", null, bench.concLabel + " " + c));
     });
     thead.appendChild(hr);
@@ -1132,16 +1281,16 @@ TEMPLATE = r"""<!DOCTYPE html>
         var tr = el("tr");
         tr.appendChild(providerCell(p));
         tr.appendChild(el("td", null, d.label));
-        bench.concurrency.forEach(function (c) {
-          var v = bench.cells[p.key + "|" + d.value + "|" + c];
+        levels.forEach(function (c) {
+          var v = view.cells[p.key + "|" + d.value + "|" + c];
           var td = el("td");
           if (!v) {
             td.appendChild(document.createTextNode("-"));
           } else {
-            td.appendChild(document.createTextNode(fmt(v.mean)));
+            td.appendChild(document.createTextNode(nf(v.mean)));
             td.appendChild(el("div", "range", individual
-              ? (v.vals || []).map(function (rv) { return fmt(rv[1]); }).join(" \u00b7 ")
-              : fmt(v.min) + "\u2013" + fmt(v.max) + " / n=" + v.runs));
+              ? (v.vals || []).map(function (rv) { return nf(rv[1]); }).join(" \u00b7 ")
+              : nf(v.min) + "\u2013" + nf(v.max) + " / n=" + v.runs));
           }
           tr.appendChild(td);
         });
@@ -1151,56 +1300,26 @@ TEMPLATE = r"""<!DOCTYPE html>
     t.appendChild(tb);
   }
 
-  function buildPeakTable(host, bench, eff) {
-    var t = tableShell(host, eff
-      ? bench.txnWord + " completed per USD of instance spend: every transaction of "
-        + "every run at that data-set size, summed, over the price of the instance. "
-        + "The sub-line is the total and the price it was divided by, and n is how "
-        + "many measurements went into the sum - a provider with fewer is doing less "
-        + "work, not slower work. FX as of " + DATA.fx.asof + " (" + DATA.fx.source + ")."
-      : "Peak " + bench.metric + " per provider and data set, with the "
-        + bench.concLabel.toLowerCase() + " level that reached it. Every data set, not just "
-        + "the selected one.");
+  function buildPeakTable(host, bench) {
+    var t = tableShell(host, "Peak " + bench.metric + " per provider and data set, with the "
+      + bench.concLabel.toLowerCase() + " level that reached it. Every data set, not just "
+      + "the selected one.");
     var thead = el("thead"), hr = el("tr");
     hr.appendChild(el("th", null, "Provider"));
-    if (eff) hr.appendChild(el("th", null, "Cost"));
     bench.datasets.forEach(function (d) { hr.appendChild(el("th", null, d.label)); });
-    if (eff) hr.appendChild(el("th", null, "All sizes"));
     thead.appendChild(hr);
     t.appendChild(thead);
     var tb = el("tbody");
     bench.providers.forEach(function (p) {
       var tr = el("tr");
       tr.appendChild(providerCell(p));
-      if (eff) {
-        var ct = el("td");
-        ct.appendChild(document.createTextNode(usd(p.costUsd)));
-        if (p.costCurrency && p.costCurrency !== "USD") {
-          ct.appendChild(el("div", "range", p.costNative + " " + p.costCurrency));
-        }
-        tr.appendChild(ct);
-      }
-      var keys = bench.datasets.map(function (d) { return d.value; });
-      if (eff) keys.push("all");
-      keys.forEach(function (k) {
-        var td = el("td");
-        if (eff) {
-          var w = bench.totals[p.key + "|" + k];
-          if (!w || !p.costUsd) {
-            td.appendChild(document.createTextNode("-"));
-          } else {
-            td.appendChild(document.createTextNode(fmtc(w.txn / p.costUsd)));
-            td.appendChild(el("div", "range",
-              fmt(w.txn) + " / " + usd(p.costUsd) + "  \u00b7  n=" + w.n));
-          }
+      bench.datasets.forEach(function (d) {
+        var td = el("td"), q = bench.peaks[p.key + "|" + d.value];
+        if (!q) {
+          td.appendChild(document.createTextNode("-"));
         } else {
-          var q = bench.peaks[p.key + "|" + k];
-          if (!q) {
-            td.appendChild(document.createTextNode("-"));
-          } else {
-            td.appendChild(document.createTextNode(fmt(q.value)));
-            td.appendChild(el("div", "range", bench.concShort + "=" + q.at));
-          }
+          td.appendChild(document.createTextNode(fmt(q.value)));
+          td.appendChild(el("div", "range", bench.concShort + "=" + q.at));
         }
         tr.appendChild(td);
       });
@@ -1209,10 +1328,254 @@ TEMPLATE = r"""<!DOCTYPE html>
     t.appendChild(tb);
   }
 
+  // --------------------------------------------------- cost efficiency ------
+  // One figure for the whole report rather than one per benchmark: the bill
+  // covers every hour the host ran, whatever it was doing, so the measure
+  // counts every transaction the database host committed - measured runs,
+  // ramp-ups, schema builds, data loads, idle time - against what the provider
+  // has charged for running it. Five named categories ranked by value, so bars
+  // with the names on the axis, and no legend: the axis already carries identity.
+  function costFigure() {
+    var cost = DATA.cost;
+    var fig = el("figure", "card");
+    var cap = el("figcaption");
+    var grow = el("div", "grow");
+    grow.appendChild(el("div", "fig-title", cost.title));
+    grow.appendChild(el("div", "fig-sub", cost.sub));
+    cap.appendChild(grow);
+    var tableBtn = el("button", null, "Table view");
+    tableBtn.type = "button";
+    tableBtn.setAttribute("aria-pressed", "false");
+    cap.appendChild(tableBtn);
+    fig.appendChild(cap);
+
+    var plot = el("div", "plot");
+    fig.appendChild(plot);
+    var tableWrap = el("div", "table-wrap");
+    fig.appendChild(tableWrap);
+    var tip = Tooltip(fig);
+
+    tableBtn.addEventListener("click", function () {
+      var open = tableWrap.getAttribute("data-open") === "1";
+      tableWrap.setAttribute("data-open", open ? "0" : "1");
+      tableBtn.setAttribute("aria-pressed", open ? "false" : "true");
+    });
+
+    function render() {
+      plot.textContent = "";
+      tip.hide();
+
+      var surface = cssVar("--surface-1"), grid = cssVar("--grid"),
+          axis = cssVar("--axis"), muted = cssVar("--text-muted"),
+          secondary = cssVar("--text-secondary"), primary = cssVar("--text-primary");
+
+      // Priced hosts with counters first, in rank order; anything that cannot
+      // be placed on the scale is listed after them rather than dropped, so a
+      // missing provider is visible as missing.
+      var rows = cost.providers.slice().sort(function (a, b) {
+        return (b.perUsd || -1) - (a.perUsd || -1);
+      });
+
+      var max = 0;
+      rows.forEach(function (p) { if (p.perUsd) max = Math.max(max, p.perUsd); });
+      var scale0 = ticks(max, 6);
+      var tk = scale0.ticks, top = scale0.top;
+
+      var PITCH = 56, BAR = 24;                     // bars capped at 24px
+      var W = 1100, M = { t: 16, r: 300, b: 50, l: 146 };
+      var ph = PITCH * rows.length;
+      var H = M.t + ph + M.b;
+      var pw = W - M.l - M.r;
+      function xOf(v) { return M.l + (v / top) * pw; }
+
+      var svg = svgEl("svg", { viewBox: "0 0 " + W + " " + H, role: "img" });
+      svg.setAttribute("aria-label", cost.title + ". " + cost.sub + ".");
+
+      tk.forEach(function (t) {
+        svg.appendChild(svgEl("line", {
+          x1: xOf(t), y1: M.t, x2: xOf(t), y2: M.t + ph, stroke: grid, "stroke-width": 1,
+        }));
+        var lab = svgEl("text", { x: xOf(t), y: M.t + ph + 22, "text-anchor": "middle", fill: muted, "font-size": 12.5 });
+        lab.textContent = fmtc(t);
+        svg.appendChild(lab);
+      });
+      svg.appendChild(svgEl("line", { x1: M.l, y1: M.t, x2: M.l, y2: M.t + ph, stroke: axis, "stroke-width": 1 }));
+      var xlab = svgEl("text", { x: M.l + pw / 2, y: H - 8, "text-anchor": "middle", fill: secondary, "font-size": 13 });
+      xlab.textContent = "Transactions committed on the database host per USD billed";
+      svg.appendChild(xlab);
+
+      rows.forEach(function (p, i) {
+        var yTop = M.t + i * PITCH, yc = yTop + PITCH / 2;
+        var g = svgEl("g", { tabindex: "0", role: "img" });
+        g.setAttribute("aria-label", p.name + ": " + (p.perUsd
+          ? fmtc(p.perUsd) + " transactions per USD, " + fmt(p.txn)
+            + " transactions over " + fmt(p.hours) + " host hours for " + usd(p.costUsd)
+          : p.costUsd ? "no counter data" : "not priced"));
+
+        var name = svgEl("text", { x: M.l - 14, y: yc + 4.5, "text-anchor": "end", fill: secondary, "font-size": 13 });
+        name.textContent = p.name;
+        g.appendChild(name);
+        // Identity comes from the colored mark beside the text, never from
+        // coloring the text itself.
+        g.appendChild(svgEl("rect", {
+          x: M.l - 9, y: yc - 4.5, width: 9, height: 9, rx: 2, fill: colorOf(p),
+        }));
+
+        if (!p.perUsd) {
+          var none = svgEl("text", { x: M.l + 12, y: yc + 4.5, fill: muted, "font-size": 12.5 });
+          none.textContent = p.costUsd ? "no counter data" : "not priced";
+          g.appendChild(none);
+          svg.appendChild(g);
+          return;
+        }
+
+        var color = colorOf(p);
+        var bar = svgEl("path", {
+          d: barPathH(yc - BAR / 2, BAR, M.l, xOf(p.perUsd), 4), fill: color,
+        });
+        g.appendChild(bar);
+        // Value at the tip, outside the bar end so it is never clipped; the
+        // numerator, the price it was divided by and how long the host was
+        // billed for sit underneath, because the ratio alone hides all three.
+        var tipX = xOf(p.perUsd) + 12;
+        // The labels sit out in the gridded field, so each is painted over a
+        // 2px surface halo - otherwise a gridline runs through the digits.
+        var halo = { stroke: surface, "stroke-width": 2.5, "paint-order": "stroke" };
+        var v1 = svgEl("text", { x: tipX, y: yc - 1, fill: primary, "font-size": 13, "font-weight": 600 });
+        for (var hk in halo) v1.setAttribute(hk, halo[hk]);
+        v1.textContent = fmtc(p.perUsd);
+        g.appendChild(v1);
+        var v2 = svgEl("text", { x: tipX, y: yc + 12, fill: muted, "font-size": 10.5 });
+        for (var hk2 in halo) v2.setAttribute(hk2, halo[hk2]);
+        v2.textContent = fmtc(p.txn) + " / " + usd(p.costUsd) + "  \u00b7  "
+          + fmt(p.hours) + " h";
+        g.appendChild(v2);
+
+        // The hit target is the whole row, far bigger than the mark.
+        g.appendChild(svgEl("rect", { x: M.l, y: yTop, width: pw, height: PITCH, fill: "transparent" }));
+
+        function show(ev) {
+          bar.setAttribute("stroke", surface);
+          bar.setAttribute("stroke-width", 2);
+          var box = svg.getBoundingClientRect(), scale = box.width / W;
+          tip.show(p.name, [{
+            color: color,
+            name: "Transactions per USD billed",
+            value: fmtc(p.perUsd),
+            range: fmt(p.txn) + " transactions / " + usd(p.costUsd)
+              + (p.costCurrency && p.costCurrency !== "USD"
+                 ? " (" + p.costNative + " " + p.costCurrency + ")" : ""),
+          }, {
+            color: color,
+            name: "Of those, outside the measured runs",
+            value: fmtc(p.setup),
+            range: fmt(p.hours) + " host hours billed, " + p.sessionCount + " session"
+              + (p.sessionCount === 1 ? "" : "s") + " of "
+              + p.benches.join(" and ") + ", "
+              + p.runs + " measured runs",
+          }], ev && ev.clientX !== undefined ? ev.clientX : box.left + xOf(p.perUsd) * scale,
+             ev && ev.clientY !== undefined ? ev.clientY : box.top + yc * scale);
+        }
+        function hide() {
+          bar.removeAttribute("stroke");
+          bar.removeAttribute("stroke-width");
+          tip.hide();
+        }
+        g.addEventListener("pointermove", show);
+        g.addEventListener("pointerleave", hide);
+        g.addEventListener("focus", show);
+        g.addEventListener("blur", hide);
+        svg.appendChild(g);
+      });
+
+      plot.appendChild(svg);
+      plot.appendChild(el("div", "note", costNote(rows)));
+      buildCostEffTable(tableWrap);
+    }
+
+    render();
+    fig.addEventListener("viz:rerender", render);
+    return fig;
+  }
+
+  // What belongs next to the number: what the counter counts, what the price
+  // covers, and the one place the count undershoots the work the host did.
+  function costNote(rows) {
+    var cheap = null, dear = null;
+    rows.forEach(function (p) {
+      if (!p.perUsd || !p.hours) return;
+      var r = p.costUsd / p.hours;
+      if (cheap === null || r < cheap) cheap = r;
+      if (dear === null || r > dear) dear = r;
+    });
+    return "Counted as Com_commit + Com_rollback on the database server itself, "
+      + "from the first capture to the last, so schema builds, data loads, ramp-ups "
+      + "and idle time count alongside the measured runs. The price is what each "
+      + "provider has billed for running the host up to now - usage accrued to date, "
+      + "not a flat rate - so the hours each campaign took are already in the "
+      + "denominator, at " + cheap.toFixed(2) + " to " + dear.toFixed(2) + " USD per "
+      + "host-hour; idle hours cost money and commit nothing, which is the point. "
+      + "sysbench loads its tables with autocommitted bulk inserts, which do not "
+      + "increment the commit counter, so that work shows up as rows inserted in the "
+      + "table view rather than here. Prices converted at one dated rate table, as of "
+      + DATA.fx.asof + " (" + DATA.fx.source + ").";
+  }
+
+  function buildCostEffTable(host) {
+    var cost = DATA.cost;
+    var t = tableShell(host, "Every transaction the database host committed over the "
+      + "whole campaign, per USD billed for running it, split between the measured runs and "
+      + "everything else the host did. InnoDB rows inserted is carried because "
+      + "sysbench's autocommitted data load moves that counter and not the commit one.");
+    var thead = el("thead"), hr = el("tr");
+    ["Provider", "Cost", "Sessions", "Host hours", "Transactions", "In runs",
+     "Builds and idle", "InnoDB rows inserted", "Per USD"].forEach(function (h) {
+      hr.appendChild(el("th", null, h));
+    });
+    thead.appendChild(hr);
+    t.appendChild(thead);
+    var tb = el("tbody");
+    cost.providers.slice().sort(function (a, b) {
+      return (b.perUsd || -1) - (a.perUsd || -1);
+    }).forEach(function (p) {
+      var tr = el("tr");
+      tr.appendChild(providerCell(p));
+      var ct = el("td");
+      ct.appendChild(document.createTextNode(usd(p.costUsd)));
+      if (p.costCurrency && p.costCurrency !== "USD") {
+        ct.appendChild(el("div", "range", p.costNative + " " + p.costCurrency));
+      }
+      tr.appendChild(ct);
+      var sc = el("td");
+      sc.appendChild(document.createTextNode(String(p.sessionCount)));
+      if (p.benches && p.benches.length) {
+        sc.appendChild(el("div", "range", p.benches.join(" + ")));
+      }
+      tr.appendChild(sc);
+      tr.appendChild(el("td", null, fmt(p.hours)));
+      tr.appendChild(el("td", null, fmt(p.txn)));
+      var ir = el("td");
+      ir.appendChild(document.createTextNode(fmt(p.inRuns)));
+      ir.appendChild(el("div", "range", p.runs + " measured runs"));
+      tr.appendChild(ir);
+      tr.appendChild(el("td", null, fmt(p.setup)));
+      tr.appendChild(el("td", null, fmt(p.rows)));
+      tr.appendChild(el("td", null, p.perUsd ? fmtc(p.perUsd) : "-"));
+      tb.appendChild(tr);
+    });
+    t.appendChild(tb);
+    if (cost.skipped && cost.skipped.length) {
+      host.appendChild(el("div", "note", "Sessions left out of the count: "
+        + cost.skipped.map(function (s) { return s.name + " (" + s.why + ")"; }).join("; ")
+        + "."));
+    }
+  }
+
   // --------------------------------------------------------------- pricing ---
   function buildCostTable(host) {
-    var t = tableShell(host, "What the benchmarked instance cost at each provider, as billed, "
-      + "converted at one dated rate table so the per-dollar figures are comparable. "
+    var t = tableShell(host, "What each provider has billed for the benchmarked instance "
+      + "up to now - usage accrued to date, not a flat rate - converted at one dated "
+      + "rate table so the per-dollar figures are comparable. "
       + "Rates are USD per unit of the currency, as of " + DATA.fx.asof
       + " (" + DATA.fx.source + "); they are pinned in the report, not fetched at view time.");
     var thead = el("thead"), hr = el("tr");
@@ -1281,7 +1644,10 @@ TEMPLATE = r"""<!DOCTYPE html>
   document.getElementById("meta").textContent =
     "Generated " + DATA.generated + " from " + DATA.root +
     " - mean of the measured window across runs, 5 min ramp-up discarded. " +
-    "Costs converted to USD at rates as of " + DATA.fx.asof + " (" + DATA.fx.source + ").";
+    "Cost efficiency counts every transaction the database host committed, " +
+    "benchmark runs and database initialization alike, from the server's own " +
+    "counters; costs converted to USD at rates as of " + DATA.fx.asof +
+    " (" + DATA.fx.source + ").";
 
   var host = document.getElementById("benches");
   DATA.benches.forEach(function (bench) {
@@ -1290,9 +1656,10 @@ TEMPLATE = r"""<!DOCTYPE html>
 
     // One control row above both charts in the section; they re-render against
     // the same slice. The two benchmarks size their data differently (rows per
-    // table vs warehouses), so each section scopes its own.
+    // table vs warehouses), so each section scopes its own - and each reads its
+    // own URL key, so ?sysbench=40&hammerdb=320 opens both at a chosen size.
     var state = {
-      dataset: bench.datasets.length ? bench.datasets[0].value : null,
+      dataset: initialDataset(bench),
       mode: "average",
     };
     var filters = el("div", "filters");
@@ -1301,9 +1668,13 @@ TEMPLATE = r"""<!DOCTYPE html>
         f.dispatchEvent(new Event("viz:rerender"));
       });
     }
-    segmented(filters, "Data set", bench.datasets.map(function (dd) {
+    var sizes = bench.datasets.map(function (dd) {
       return { label: dd.label, value: dd.value };
-    }), function (v) { state.dataset = v; rerender(); });
+    });
+    var picked = 0;
+    sizes.forEach(function (o, i) { if (o.value === state.dataset) picked = i; });
+    segmented(filters, "Data set", sizes,
+      function (v) { state.dataset = v; rerender(); }, picked);
     segmented(filters, "Runs", [
       { label: "Average", value: "average" },
       { label: "Individual", value: "individual" },
@@ -1319,11 +1690,22 @@ TEMPLATE = r"""<!DOCTYPE html>
       sec.appendChild(el("div", "note", "Incomplete sweep, peak taken over fewer levels: " + txt));
     }
 
-    sec.appendChild(scalingFigure(bench, state));
-    sec.appendChild(peakFigure(bench, state, false));
-    sec.appendChild(peakFigure(bench, state, true));
+    sec.appendChild(scalingFigure(bench, state, throughputView(bench)));
+    sec.appendChild(peakFigure(bench, state));
+    // Latency last, under the throughput it explains, and driven by the same
+    // controls: a provider that holds its TPS by making every statement wait
+    // should be read against the chart that shows it holding.
+    var lat = latencyView(bench);
+    if (lat) sec.appendChild(scalingFigure(bench, state, lat));
     host.appendChild(sec);
   });
+
+  var costHost = document.getElementById("cost");
+  var costSec = el("section", "bench");
+  costSec.appendChild(el("h2", null, "Cost efficiency"));
+  costSec.appendChild(costFigure());
+  costHost.appendChild(costSec);
+
   buildCostTable(document.getElementById("pricing"));
   buildInventory(document.getElementById("inventory"));
 

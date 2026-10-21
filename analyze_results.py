@@ -10,12 +10,18 @@ regardless of the order they were run in:
     <provider>_sysbench_results.csv  -> sysbench oltp_read_write, metric TPS
     <provider>_hammerdb_results.csv  -> HammerDB TPC-C,           metric NOPM
 
-One graph per image file: a scaling chart, a peak chart and a cost-efficiency
-chart for each data-set size, each emitted once per theme (light / dark), plus
-the table view of the same aggregates as CSV.  Charts of the same benchmark
-share a y-scale across the sizes, so separate files stay comparable.  Rows whose
-metric is empty or NA are dropped and reported - an aborted run leaves those
-behind.
+One graph per image file: a scaling chart and a peak chart for each data-set
+size, each emitted once per theme (light / dark), plus the table view of the
+same aggregates as CSV.  Charts of the same benchmark share a y-scale across the
+sizes, so separate files stay comparable.  Rows whose metric is empty or NA are
+dropped and reported - an aborted run leaves those behind.
+
+Cost efficiency is deliberately *not* one of those per-benchmark charts.  The
+bill covers every hour the host ran, whatever it was doing, so the measure is
+one number per provider taken from the database server's own counters: every
+transaction the host committed across the whole campaign - benchmark runs,
+ramp-ups, schema builds and data loads, idle time - per USD of what the provider
+has charged for running it.
 
 Needs only numpy + matplotlib (no pandas).
 """
@@ -32,7 +38,9 @@ from pathlib import Path
 import matplotlib
 
 matplotlib.use("Agg")
+import matplotlib.patheffects as pe
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 import numpy as np
 from matplotlib.lines import Line2D
 from matplotlib.path import Path as MPath
@@ -70,16 +78,18 @@ MAXSERIES = len(MARKERS)
 DIRNAME = re.compile(r"^(?P<provider>[A-Za-z0-9]+)-(?P<stamp>\d{8}-\d{6})(?:-(?P<label>.+))?$")
 
 # ----------------------------------------------------------------- pricing --
-# What the benchmarked instance cost at each provider, as billed - in the
-# provider's own currency, because that is the number on the invoice.  Cost
-# efficiency is throughput per USD of that spend, so every price is converted
-# through one dated rate table rather than a mix of eyeballed conversions.
+# What each provider has billed for the benchmarked instance up to now - usage
+# accrued to date, not a flat monthly rate, so the hours the campaign took are
+# already in it.  Kept in the provider's own currency, because that is the
+# number on the invoice; cost efficiency is throughput per USD of that spend, so
+# every price converts through one dated rate table rather than a mix of
+# eyeballed conversions.
 COSTS = {
     "exoscale": (75, "CHF"),
     "scaleway": (49, "EUR"),
     "vultr": (51, "USD"),
-    "upcloud": (34, "USD"),
-    "digitalocean": (16, "USD"),
+    "upcloud": (40, "USD"),
+    "digitalocean": (39, "USD"),
     "ovhcloud": (79, "AUD"),
 }
 # USD per one unit of the currency.  Pinned, not fetched at render time: a
@@ -115,36 +125,23 @@ class Session:
         self.csv_path = csv_path
         self.rows: list[dict] = []
         self.dropped = 0
-        self.window_s = session_window(path)
 
     def __repr__(self) -> str:
         return f"<{self.provider} {self.stamp} {self.bench} n={len(self.rows)}>"
 
 
-# The HammerDB CSV reports rates, not counts, so turning them back into work
-# done needs the length of the measured window.  Read it from the run's own
-# config rather than assuming the harness default, which is overridable.
-WINDOW_DEFAULT_S = 20 * 60
-DURATION_LINE = re.compile(r"^duration_min\s+(\d+)")
-
-
-def session_window(path: Path) -> int:
-    for cfg in sorted(path.glob("*_config.txt")):
-        for line in cfg.read_text(errors="replace").splitlines():
-            m = DURATION_LINE.match(line)
-            if m:
-                return int(m.group(1)) * 60
-    print(f"analyze_results.py: no duration_min in {path.name}, assuming "
-          f"{WINDOW_DEFAULT_S // 60} min", file=sys.stderr)
-    return WINDOW_DEFAULT_S
+def dir_identity(d: Path) -> tuple[str, str]:
+    """(provider, UTC stamp) from a results directory name."""
+    m = DIRNAME.match(d.name)
+    if not m:
+        return d.name.split("-")[0].lower(), ""
+    return m.group("provider").lower(), m.group("stamp")
 
 
 def discover(root: Path) -> list[Session]:
     sessions = []
     for d in sorted(p for p in root.iterdir() if p.is_dir()):
-        m = DIRNAME.match(d.name)
-        provider = m.group("provider").lower() if m else d.name.split("-")[0].lower()
-        stamp = m.group("stamp") if m else ""
+        provider, stamp = dir_identity(d)
         for bench, pattern in (("sysbench", "*_sysbench_results.csv"),
                                ("hammerdb", "*_hammerdb_results.csv")):
             for csv_path in sorted(d.glob(pattern)):
@@ -162,42 +159,170 @@ def _num(value: str) -> float | None:
         return None
 
 
-def load(session: Session) -> None:
-    """Read the session CSV into rows of {dataset, conc, metric, txn, run}.
+# ---------------------------------------------------------------- latency ----
+# sysbench reports its own p95 and the harness asks for it (--percentile=95),
+# so the CSV column is taken as given.  It covers the measured window only:
+# --report-checkpoints resets the counters at the end of the ramp-up and the
+# harness parses the last statistics block.
+#
+# HammerDB keeps its response times in the xtprof profile, copied next to the
+# run log.  Each file ends with a SUMMARY block that HammerDB merges across the
+# active virtual users, so the p95 there is a real percentile over every call -
+# not an average of per-user percentiles, which cannot be combined.  NEWORD is
+# the new-order transaction, the one TPC-C response time that is quoted.
+# Unlike NOPM it is *not* windowed: xtprof is never reset, so the figure covers
+# the ramp-up as well as the measured 20 minutes.
+XTPROF_NAME = re.compile(r"_run(?P<run>\d+)_w(?P<dataset>\d+)_vu(?P<conc>\d+)"
+                         r"_hdbxtprofile\.log$")
+# Non-greedy and barred from crossing the next ">>>>>" marker, so a NEWORD
+# block without a percentile line cannot borrow the next procedure's.
+XTPROF_P95 = re.compile(r"PROC: NEWORD\n(?:(?!>>>>>).)*?P95: ([\d.]+)ms", re.S)
 
-    `txn` is the work the measurement actually did - a count, not a rate - so
-    that the runs of a provider can be summed.  sysbench reports the count
-    itself (its post-ramp-up block, hence transactions == tps * window);
-    HammerDB reports only rates, so the count comes back from tpm * window.
-    """
+
+def hammerdb_p95(session: Session) -> dict[tuple[int, int, int], float]:
+    """New-Order p95 in ms per (run, warehouses, virtual users)."""
+    out: dict[tuple[int, int, int], float] = {}
+    for log in sorted((session.path / "hammerdb").glob("*_hdbxtprofile.log")):
+        name = XTPROF_NAME.search(log.name)
+        if not name:
+            continue
+        # The last SUMMARY block is the one merged over all the virtual users;
+        # everything before it is a single user's own profile.
+        tail = log.read_text(errors="replace").rpartition(">>>>> SUMMARY OF ")[2]
+        hit = XTPROF_P95.search(tail)
+        if hit:
+            out[tuple(int(name[k]) for k in ("run", "dataset", "conc"))] = float(hit[1])
+    return out
+
+
+def load(session: Session) -> None:
+    """Read the session CSV into rows of {dataset, conc, metric, p95, run}."""
     # sysbench: provider,benchmark,run,tables,rows_per_table,threads,
-    #           elapsed_s,transactions,tps,queries,qps,...
+    #           elapsed_s,transactions,tps,queries,qps,lat_*,errors
     # hammerdb: provider,benchmark,run,warehouses,vu,nopm,tpm,status,log_errors
     key = ("rows_per_table", "threads", "tps") if session.bench == "sysbench" \
         else ("warehouses", "vu", "nopm")
-    minutes = session.window_s / 60.0
+    lat = {} if session.bench == "sysbench" else hammerdb_p95(session)
     with session.csv_path.open(newline="") as fh:
         for rec in csv.DictReader(fh):
             dataset, conc, metric = (_num(rec.get(k, "")) for k in key)
             if None in (dataset, conc, metric) or metric <= 0:
                 session.dropped += 1
                 continue
-            if session.bench == "sysbench":
-                # Counted by sysbench; derived only if that column is missing.
-                txn = _num(rec.get("transactions", "")) or metric * session.window_s
-                nord = txn
-            else:
-                # TPC-C counts all five transaction types; new orders are the
-                # metric of record, so both are kept.
-                tpm = _num(rec.get("tpm", "")) or 0.0
-                nord = metric * minutes
-                txn = tpm * minutes or nord
+            dataset, conc = int(dataset), int(conc)
+            run = int(_num(rec.get("run", "0")) or 0)
+            # A row can have throughput and no latency (an older CSV, a missing
+            # profile).  That is not a reason to drop the throughput, so the
+            # latency is carried as None and counted where it is aggregated.
+            p95 = _num(rec.get("lat_p95_ms", "")) if session.bench == "sysbench" \
+                else lat.get((run, dataset, conc))
             session.rows.append(dict(
-                dataset=int(dataset), conc=int(conc), metric=metric,
-                txn=txn, nord=nord,
-                run=int(_num(rec.get("run", "0")) or 0),
+                dataset=dataset, conc=conc, metric=metric,
+                p95=p95 if (p95 or 0) > 0 else None, run=run,
                 provider=rec.get("provider", session.provider).strip() or session.provider,
             ))
+
+
+# ------------------------------------------------------------- host work ----
+# Cost efficiency is not a property of a benchmark: the bill covers every hour
+# the host ran, whatever it was doing.  MySQL's own counters are the
+# only record that covers all of it, so the total comes from SHOW GLOBAL STATUS
+# as the harness captured it, not from the result CSVs:
+#
+#   <provider>_status_baseline.tsv    counters when the session started
+#   <provider>_status_final.tsv       counters when it finished
+#   <provider>_status_delta_*.tsv     before / after / delta of one measured run
+#
+# A transaction here is a commit or a rollback.  What that includes is worth
+# being precise about: HammerDB's schema build commits in batches and shows up,
+# while sysbench's data load inserts its rows in autocommit, which MySQL does
+# not count as an explicit transaction - so the row counters are carried
+# alongside, where the loads are plainly visible.
+TXN_KEYS = ("Com_commit", "Com_rollback")
+STATUS_KEYS = TXN_KEYS + ("Com_insert", "Queries", "Innodb_rows_inserted", "Uptime")
+
+
+def read_status(path: Path, column: int = 0) -> dict[str, int]:
+    """One SHOW GLOBAL STATUS capture as {variable: value}.  The delta files
+    carry three value columns (before, after, delta); column picks one."""
+    out: dict[str, int] = {}
+    for line in path.read_text(errors="replace").splitlines():
+        f = line.split("\t")
+        if len(f) < 2 + column:
+            continue
+        try:
+            out[f[0]] = int(f[1 + column])
+        except ValueError:
+            continue
+    return out
+
+
+def host_session(path: Path) -> dict | None:
+    """What the host did over one results directory, or None if it kept no
+    counters (an aborted session leaves a baseline and nothing to subtract)."""
+    provider, stamp = dir_identity(path)
+    srv = path / "server"
+    base = sorted(srv.glob("*_status_baseline.tsv")) if srv.is_dir() else []
+    final = sorted(srv.glob("*_status_final.tsv")) if srv.is_dir() else []
+    head = dict(path=path, name=path.name, provider=provider, stamp=stamp)
+    if not base or not final:
+        return dict(head, ok=False, why="no start/end counter capture")
+    first, last = read_status(base[0]), read_status(final[0])
+    delta = {k: last.get(k, 0) - first.get(k, 0) for k in STATUS_KEYS}
+    # Status counters are cumulative since server start, so a restart mid-session
+    # resets them and the subtraction goes negative.  Drop the session rather
+    # than report a total that is short by an unknown amount.
+    if min(delta[k] for k in TXN_KEYS) < 0 or delta["Uptime"] <= 0:
+        return dict(head, ok=False, why="counters reset mid-session (restart)")
+    in_run = 0
+    runs = sorted(srv.glob("*_status_delta_*.tsv"))
+    for d in runs:
+        per = read_status(d, column=2)
+        in_run += sum(per.get(k, 0) for k in TXN_KEYS)
+    txn = sum(delta[k] for k in TXN_KEYS)
+    benches = sorted(b for b, pat in (("sysbench", "*_sysbench_results.csv"),
+                                      ("hammerdb", "*_hammerdb_results.csv"))
+                     if any(path.glob(pat)))
+    return dict(head, ok=True, why="", benches=benches, runs=len(runs),
+                txn=txn,
+                # Everything the counters saw that was not inside a measured
+                # run: the schema builds and data loads, plus idle time.
+                in_run=min(in_run, txn), setup=max(txn - in_run, 0),
+                hours=delta["Uptime"] / 3600.0, queries=delta["Queries"],
+                inserts=delta["Com_insert"], rows=delta["Innodb_rows_inserted"])
+
+
+class HostWork:
+    """Every transaction the billed hosts committed, per provider."""
+
+    def __init__(self, root: Path):
+        self.sessions: list[dict] = []
+        self.skipped: list[dict] = []
+        for d in sorted(p for p in root.iterdir() if p.is_dir()):
+            rec = host_session(d)
+            if rec is None:
+                continue
+            (self.sessions if rec["ok"] else self.skipped).append(rec)
+        self.providers = sorted({r["provider"] for r in self.sessions})
+
+    def of(self, provider: str) -> list[dict]:
+        return [r for r in self.sessions if r["provider"] == provider]
+
+    def total(self, provider: str) -> dict:
+        """The provider's whole campaign as one record."""
+        rows = self.of(provider)
+        out = {k: sum(r[k] for r in rows) for k in
+               ("txn", "in_run", "setup", "runs", "hours", "queries", "inserts", "rows")}
+        out["sessions"] = len(rows)
+        out["benches"] = sorted({b for r in rows for b in r["benches"]})
+        return out
+
+    def per_usd(self, provider: str) -> float | None:
+        """Transactions per USD of the instance price, or None if either side
+        is missing - a provider without a price gets no bar, not a zero."""
+        txn = self.total(provider)["txn"]
+        usd = cost_usd(provider)
+        return None if not txn or not usd else txn / usd
 
 
 # --------------------------------------------------------------- aggregation --
@@ -205,23 +330,21 @@ class Agg:
     """mean / min / max of a metric per (provider, dataset, concurrency), plus
     the individual run values behind each of those means."""
 
-    def __init__(self, bench: str, sessions: list[Session]):
+    def __init__(self, bench: str, sessions: list[Session], field: str = "metric"):
         self.bench = bench
         self.sessions = sessions
+        self.field = field
+        self.missing = 0            # rows that carried no value for this field
         bucket: dict[tuple[str, int, int], list[float]] = defaultdict(list)
         runs: dict[tuple[str, int, int], list[tuple[int, float]]] = defaultdict(list)
-        # Work done, summed over every measurement: all concurrency levels, all
-        # runs.  [transactions, new-order transactions, measurements].
-        work: dict[tuple[str, int], list[float]] = defaultdict(lambda: [0.0, 0.0, 0])
         for s in sessions:
             for r in s.rows:
-                bucket[(s.provider, r["dataset"], r["conc"])].append(r["metric"])
-                runs[(s.provider, r["dataset"], r["conc"])].append((r["run"], r["metric"]))
-                w = work[(s.provider, r["dataset"])]
-                w[0] += r["txn"]
-                w[1] += r["nord"]
-                w[2] += 1
-        self.work = dict(work)
+                value = r.get(field)
+                if value is None:
+                    self.missing += 1
+                    continue
+                bucket[(s.provider, r["dataset"], r["conc"])].append(value)
+                runs[(s.provider, r["dataset"], r["conc"])].append((r["run"], value))
         self.stats = {k: (float(np.mean(v)), float(np.min(v)), float(np.max(v)), len(v))
                       for k, v in bucket.items()}
         # Kept in run order so "individual runs" is a stable series, not a set.
@@ -247,16 +370,15 @@ class Agg:
                 best = (value, conc)
         return best
 
-    def total(self, provider: str, dataset: int | None = None):
-        """Transactions summed over all runs - of one data-set size, or of the
-        whole benchmark when dataset is None.  Returns (txn, new orders, n)."""
-        keys = [(provider, dataset)] if dataset is not None else \
-            [(provider, d) for d in self.datasets]
-        rows = [self.work[k] for k in keys if k in self.work]
-        if not rows:
-            return (None, None, 0)
-        return (sum(r[0] for r in rows), sum(r[1] for r in rows),
-                int(sum(r[2] for r in rows)))
+    def at_top(self, provider: str, dataset: int):
+        """The value at the highest concurrency level this provider reached, with
+        that level.  For latency the interesting figure is the loaded one, and
+        not every provider got to the same top of the sweep."""
+        for conc in reversed(self.concurrency):
+            value = self.mean(provider, dataset, conc)
+            if value is not None:
+                return value, conc
+        return None, None
 
     def incomplete(self) -> list[tuple[str, int, list[int]]]:
         """Provider/data-set pairs that did not cover the whole sweep - their
@@ -276,11 +398,6 @@ def label_dataset(bench: str, value: int) -> str:
     if bench == "sysbench":
         return f"{value // 1_000_000}M rows/table" if value >= 1_000_000 else f"{value:,} rows/table"
     return f"{value} warehouses"
-
-
-def txn_word(bench: str) -> str:
-    """What one counted unit of work is called in this benchmark."""
-    return "transactions" if bench == "sysbench" else "TPC-C transactions"
 
 
 def compact(v: float) -> str:
@@ -320,18 +437,22 @@ def style(mode: str) -> dict:
     return t
 
 
-def chrome(ax, t: dict, ylabel: str = "") -> None:
-    """Recessive axes: hairline solid y-grid, no top/right spines."""
+def chrome(ax, t: dict, label: str = "", orient: str = "v") -> None:
+    """Recessive axes: a hairline solid grid along the value axis only, no
+    top/right spines.  orient="h" for bars that run sideways."""
+    value_axis = "y" if orient == "v" else "x"
     ax.set_axisbelow(True)
-    ax.grid(axis="y", color=t["grid"], linewidth=1.0, linestyle="-")
-    ax.grid(axis="x", visible=False)
+    ax.grid(axis=value_axis, color=t["grid"], linewidth=1.0, linestyle="-")
+    ax.grid(axis="x" if value_axis == "y" else "y", visible=False)
     for side in ("top", "right"):
         ax.spines[side].set_visible(False)
     for side in ("left", "bottom"):
         ax.spines[side].set_color(t["axis"])
-    ax.yaxis.set_major_formatter(lambda v, _pos: f"{v:,.0f}")
-    if ylabel:
-        ax.set_ylabel(ylabel, color=t["secondary"], labelpad=8)
+    getattr(ax, f"{value_axis}axis").set_major_formatter(lambda v, _pos: f"{v:,.0f}")
+    if label and orient == "v":
+        ax.set_ylabel(label, color=t["secondary"], labelpad=8)
+    elif label:
+        ax.set_xlabel(label, color=t["secondary"], labelpad=8)
 
 
 def px_to_data(ax, px: float, axis: str = "x") -> float:
@@ -369,6 +490,32 @@ def rounded_bar(ax, x: float, width: float, height: float, color: str,
     return patch
 
 
+def rounded_barh(ax, y: float, height: float, length: float, color: str,
+                 radius_px: float = 4.0):
+    """The same bar on its side: 4px rounded data-end, square at the baseline."""
+    if length <= 0:
+        return
+    rx = min(px_to_data(ax, radius_px, "x"), length)
+    ry = min(px_to_data(ax, radius_px, "y"), height / 2)
+    bottom, top, end = y - height / 2, y + height / 2, length
+    k = 0.5523
+    verts = [
+        (0, bottom), (end - rx, bottom),
+        (end - rx + rx * k, bottom), (end, bottom + ry - ry * k), (end, bottom + ry),
+        (end, top - ry),
+        (end, top - ry + ry * k), (end - rx + rx * k, top), (end - rx, top),
+        (0, top), (0, bottom),
+    ]
+    codes = [MPath.MOVETO, MPath.LINETO,
+             MPath.CURVE4, MPath.CURVE4, MPath.CURVE4,
+             MPath.LINETO,
+             MPath.CURVE4, MPath.CURVE4, MPath.CURVE4,
+             MPath.LINETO, MPath.CLOSEPOLY]
+    patch = PathPatch(MPath(verts, codes), facecolor=color, edgecolor="none", zorder=3)
+    ax.add_patch(patch)
+    return patch
+
+
 def figure_legend(fig, providers: list[str], colors: list[str], t: dict,
                   y: float = 0.0, ncol: int | None = None) -> None:
     """A legend is always present for two or more series."""
@@ -391,8 +538,13 @@ def titles(fig, title: str, subtitle: str, t: dict) -> None:
 
 # -------------------------------------------------------------------- charts --
 def chart_scaling(agg: Agg, mode: str, out: Path, metric: str, conc_label: str,
-                  title: str, subtitle: str, dataset: int) -> Path:
-    """Throughput against the concurrency sweep, for one data-set size."""
+                  title: str, subtitle: str, dataset: int,
+                  logy: bool = False) -> Path:
+    """A metric against the concurrency sweep, for one data-set size.
+
+    logy for latency: p95 here spans two decades across the providers, and on a
+    linear axis the slowest one flattens the other five into the baseline.
+    """
     t = style(mode)
     colors = SERIES[mode]
     fig, ax = plt.subplots(figsize=(10.3, 5.4))
@@ -401,6 +553,7 @@ def chart_scaling(agg: Agg, mode: str, out: Path, metric: str, conc_label: str,
     # own file: these charts are read side by side, and an axis that re-fitted
     # per file would let a slower data set draw a taller line than a faster one.
     ymax = max((v[2] for v in agg.stats.values()), default=1.0)
+    ymin = min((v[1] for v in agg.stats.values() if v[1] > 0), default=1.0)
 
     chrome(ax, t, metric)
     for i, provider in enumerate(agg.providers):
@@ -420,7 +573,17 @@ def chart_scaling(agg: Agg, mode: str, out: Path, metric: str, conc_label: str,
     ax.set_xticks(xs, [str(c) for c in agg.concurrency])
     ax.tick_params(axis="x", labelcolor=t["secondary"])
     ax.set_xlim(-0.35, len(xs) - 0.65)
-    ax.set_ylim(0, ymax * 1.08)
+    if logy:
+        # 1-2-5 per decade: enough gridlines to read a value off, few enough to
+        # stay recessive.  A log axis cannot start at zero, so it is said in the
+        # axis label rather than left for the reader to infer from the ticks.
+        ax.set_yscale("log")
+        ax.set_ylim(ymin / 1.4, ymax * 1.4)
+        ax.yaxis.set_major_locator(mticker.LogLocator(base=10, subs=(1, 2, 5), numticks=16))
+        ax.yaxis.set_minor_locator(mticker.NullLocator())
+        ax.yaxis.set_major_formatter(lambda v, _pos: f"{v:,.6g}")
+    else:
+        ax.set_ylim(0, ymax * 1.08)
     ax.set_xlabel(conc_label, color=t["secondary"], labelpad=6)
     ax.set_title(label_dataset(agg.bench, dataset), fontsize=11,
                  color=t["primary"], pad=10)
@@ -434,13 +597,8 @@ def chart_scaling(agg: Agg, mode: str, out: Path, metric: str, conc_label: str,
 
 
 def chart_peak(agg: Agg, mode: str, out: Path, metric: str, conc_short: str,
-               title: str, subtitle: str, dataset: int, per_usd: bool = False) -> Path:
-    """Peak throughput per provider at one data-set size, one bar per provider.
-
-    With per_usd the bar is instead every transaction the provider completed at
-    that size - summed over all concurrency levels and all runs - divided by
-    what the instance cost, so it reads as work bought per dollar.
-    """
+               title: str, subtitle: str, dataset: int) -> Path:
+    """Peak throughput per provider at one data-set size, one bar per provider."""
     t = style(mode)
     colors = SERIES[mode]
     # Only the gaps that apply to the size this file is about.
@@ -448,30 +606,12 @@ def chart_peak(agg: Agg, mode: str, out: Path, metric: str, conc_short: str,
     # Sized to the content: six 24px bars need very little width, and the only
     # thing here that wants more is the title.
     fig, ax = plt.subplots(figsize=(5.6, 5.3 if gaps else 5.0))
-    unit = metric.split()[0]
-    # Only the first letter: .capitalize() would turn "TPC-C" into "Tpc-c".
-    word = txn_word(agg.bench)
-    chrome(ax, t, f"{word[0].upper()}{word[1:]} per USD of spend"
-           if per_usd else metric)
-    if per_usd:
-        # Counts run into the tens of millions; full digits on every tick would
-        # be a wall of zeroes.
-        ax.yaxis.set_major_formatter(lambda v, _pos: compact(v))
+    chrome(ax, t, metric)
 
-    def value_at(provider: str, dataset: int) -> tuple[float | None, float | None]:
-        """(bar height, the count behind it) - the count is None off per_usd."""
-        if not per_usd:
-            return agg.peak(provider, dataset)
-        txn, _nord, _n = agg.total(provider, dataset)
-        usd = cost_usd(provider)
-        # An unpriced provider gets no bar; a zero-height one would read as
-        # "no work per dollar" rather than "price unknown".
-        return (None, None) if not txn or not usd else (txn / usd, txn)
-
-    peaks = {(0, i): value_at(p, dataset) for i, p in enumerate(agg.providers)}
+    peaks = {(0, i): agg.peak(p, dataset) for i, p in enumerate(agg.providers)}
     # Scaled to the largest bar across *all* sizes, not just this one, so the
     # three files of a benchmark stay comparable bar-for-bar.
-    ymax = max((value_at(p, d)[0] or 0.0
+    ymax = max((agg.peak(p, d)[0] or 0.0
                 for p in agg.providers for d in agg.datasets), default=1.0)
 
     ax.set_xticks([0], [label_dataset(agg.bench, dataset)])
@@ -479,11 +619,9 @@ def chart_peak(agg: Agg, mode: str, out: Path, metric: str, conc_short: str,
     ax.set_xlim(-0.55, 0.55)
     ax.set_ylim(0, ymax * 1.16)
 
-    # A peak taken over a partial sweep is not comparable with a full one, and a
-    # sum over fewer measurements even less so - it is less work, not slower
-    # work.  Say it rather than letting the bar imply otherwise.
-    note = ("Summed over fewer measurements, so not comparable: " if per_usd else
-            "Incomplete sweep, peak taken over fewer levels: ") + "; ".join(
+    # A peak taken over a partial sweep is not comparable with a full one.  Say
+    # it rather than letting the bar imply otherwise.
+    note = "Incomplete sweep, peak taken over fewer levels: " + "; ".join(
         f"{pretty(p)} {label_dataset(agg.bench, d)} ({conc_short}="
         f"{', '.join(str(c) for c in have)} only)" for p, d, have in gaps)
     # Wrapped to the figure, not run off its right edge: a footnote that is cut
@@ -522,14 +660,83 @@ def chart_peak(agg: Agg, mode: str, out: Path, metric: str, conc_short: str,
         leader = max((v[0] for (gg, _), v in peaks.items()
                       if gg == g and v[0] is not None), default=None)
         if value == leader:
-            # In cost mode the second line is the quotient's two inputs, so the
-            # bar is never an unexplained ratio.
-            second = (f"{compact(at)} / {cost_usd(agg.providers[i]):,.2f} USD"
-                      if per_usd else f"{conc_short}={at}")
-            ax.annotate(f"{compact(value) if per_usd else f'{value:,.0f}'}\n{second}",
+            ax.annotate(f"{value:,.0f}\n{conc_short}={at}",
                         (x, value), textcoords="offset points", xytext=(0, 6),
                         ha="center", va="bottom", fontsize=8.5,
                         color=t["secondary"], linespacing=1.3, zorder=5)
+
+    fig.savefig(out)
+    plt.close(fig)
+    return out
+
+
+def chart_cost(work: HostWork, mode: str, out: Path, title: str,
+               subtitle: str) -> Path:
+    """Transactions committed per USD, one bar per provider - the whole campaign
+    of each host, both benchmarks and their schema builds together.
+
+    A ranking of named categories, so the bars run sideways with the names on
+    the axis: the order is the message, and no label has to be rotated.
+    """
+    t = style(mode)
+    colors = SERIES[mode]
+    # Hue follows the provider, never the rank, so the ranking below cannot
+    # repaint anyone.
+    slot = {p: colors[i % len(colors)] for i, p in enumerate(work.providers)}
+    rows = sorted(((work.per_usd(p), p) for p in work.providers),
+                  key=lambda r: (r[0] is not None, r[0] or 0), reverse=True)
+
+    fig, ax = plt.subplots(figsize=(8.6, 0.72 * len(rows) + 3.0))
+    chrome(ax, t, "Transactions committed per USD billed", orient="h")
+    # Counts run to the millions; full digits on every tick would be a wall of
+    # zeroes.  The exact figures are in the table and the CSV.
+    ax.xaxis.set_major_formatter(lambda v, _pos: compact(v))
+    ax.set_yticks(range(len(rows)), [pretty(p) for _v, p in rows])
+    ax.tick_params(axis="y", labelcolor=t["secondary"], labelsize=10)
+    ax.set_ylim(len(rows) - 0.5, -0.5)
+    xmax = max((v or 0.0 for v, _p in rows), default=1.0)
+    # Room on the right for the value and its two inputs.
+    ax.set_xlim(0, xmax * 1.38)
+
+    note = (
+        "From the server's own counters (commits + rollbacks), start to end of "
+        "every session: benchmark runs and ramp-ups, schema builds and data "
+        "loads, and idle time in between. The spend is what each provider has "
+        "billed for running the host up to now, usage included, so the hours "
+        "each campaign took are already in the denominator - idle hours cost "
+        "money and commit nothing, which is the point. sysbench loads its data "
+        "in autocommit, which MySQL does not count as a transaction, so that "
+        "build shows up in the rows inserted rather than here."
+    )
+    lines = textwrap.wrap(note, width=int((fig.get_figwidth() - 0.3) / 0.0666))
+    foot = 0.012 + 0.0145 * len(lines)
+
+    titles(fig, title, subtitle, t)
+    fig.tight_layout(rect=(0.0, foot + 0.05, 1.0, 0.86))
+    fig.text(0.012, 0.010, "\n".join(lines), ha="left", va="bottom",
+             fontsize=8, color=t["muted"], linespacing=1.5)
+    fig.canvas.draw()
+
+    bar_h = min(0.62, px_to_data(ax, 24.0, "y"))
+    for i, (value, provider) in enumerate(rows):
+        if value is None:
+            ax.text(px_to_data(ax, 12.0), i, "not priced", va="center",
+                    fontsize=9, color=t["muted"])
+            continue
+        rounded_barh(ax, i, bar_h, value, slot[provider])
+        tx = value + px_to_data(ax, 12.0)
+        total = work.total(provider)
+        # The labels sit out in the gridded field, so each carries a 2px surface
+        # halo - otherwise a gridline runs straight through the digits.
+        halo = [pe.withStroke(linewidth=2.5, foreground=t["surface"])]
+        ax.text(tx, i - px_to_data(ax, 5.0, "y"), compact(value), va="center",
+                fontsize=10, fontweight="semibold", color=t["primary"],
+                path_effects=halo)
+        # The quotient's two inputs, so the bar is never an unexplained ratio.
+        ax.text(tx, i + px_to_data(ax, 8.0, "y"),
+                f"{compact(total['txn'])} / {cost_usd(provider):,.2f} USD"
+                f"  ·  {total['hours']:,.0f} h",
+                va="center", fontsize=8, color=t["muted"], path_effects=halo)
 
     fig.savefig(out)
     plt.close(fig)
@@ -568,81 +775,83 @@ def report_costs(providers: list[str]) -> None:
               f"{rate:>14.6f}{usd:>12,.2f}")
 
 
-def report_efficiency(agg: Agg, metric: str) -> None:
-    """Cost efficiency as total work per dollar: every transaction of every run
-    at a data-set size, divided by the price of the instance."""
-    word = txn_word(agg.bench)
-    print(f"\n{agg.bench}: cost efficiency - {word} completed per USD of spend")
-    print("  (sum over all concurrency levels and all runs of the measured window)")
-    head = "  " + f"{'provider':<14}{'USD':>9}{'n':>5}" + "".join(
-        f"{label_dataset(agg.bench, d):>26}" for d in agg.datasets) + f"{'all sizes':>26}"
-    print(head)
+def report_host_efficiency(work: HostWork) -> None:
+    """Cost efficiency as the host measured it: every transaction the database
+    committed over the whole campaign, per USD of what the instance cost."""
+    print("\ncost efficiency - transactions committed on the database host per USD")
+    print("  (the server's own counters, start to end of every session: benchmark")
+    print("   runs and ramp-ups, schema builds and data loads, and idle time)")
+    print("  " + f"{'provider':<14}{'USD':>7}{'sessions':>9}{'host-h':>8}"
+                 f"{'transactions':>15}{'in runs':>14}{'builds/idle':>13}"
+                 f"{'rows inserted':>15}{'txn per USD':>14}")
     ranked = []
-    for provider in agg.providers:
+    for provider in work.providers:
+        total = work.total(provider)
         usd = cost_usd(provider)
-        _t, _n, count = agg.total(provider)
-        line = ("  " + f"{pretty(provider):<14}"
-                + (f"{usd:>9,.0f}" if usd else f"{'-':>9}") + f"{count:>5}")
-        for dataset in list(agg.datasets) + [None]:
-            txn, _nord, _n = agg.total(provider, dataset)
-            if not txn or not usd:
-                line += f"{'no data' if not txn else 'not priced':>26}"
-                continue
-            per = txn / usd
-            line += f"{f'{compact(per)} / USD':>26}"
-            if dataset is None:
-                ranked.append((per, provider, txn))
-        print(line)
+        per = work.per_usd(provider)
+        if per is not None:
+            ranked.append((per, provider, total))
+        print("  " + f"{pretty(provider):<14}"
+              + (f"{usd:>7,.0f}" if usd else f"{'-':>7}")
+              + f"{total['sessions']:>9}{total['hours']:>8,.0f}"
+              + f"{compact(total['txn']):>15}{compact(total['in_run']):>14}"
+              + f"{compact(total['setup']):>13}{compact(total['rows']):>15}"
+              + (f"{compact(per) + ' / USD':>14}" if per is not None
+                 else f"{'not priced':>14}"))
     if ranked:
         ranked.sort(reverse=True)
         best, worst = ranked[0], ranked[-1]
-        print(f"  totals: {pretty(best[1])} completed {compact(best[2])} {word} "
-              f"= {compact(best[0])} per USD, "
-              f"{best[0] / worst[0]:.1f}x {pretty(worst[1])} ({compact(worst[0])} per USD)")
-    # A sum is only as comparable as its coverage: a provider with missing
-    # measurements shows less work done, which is not the same as slower work.
-    counts = {p: agg.total(p)[2] for p in agg.providers}
-    full = max(counts.values(), default=0)
-    short = [(p, c) for p, c in counts.items() if c < full]
-    if short:
-        print("  NOT comparable - fewer measurements in the sum: " + "; ".join(
-            f"{pretty(p)} n={c} of {full}" for p, c in short))
+        print(f"  best: {pretty(best[1])} committed {compact(best[2]['txn'])} "
+              f"transactions = {compact(best[0])} per USD, {best[0] / worst[0]:.1f}x "
+              f"{pretty(worst[1])} ({compact(worst[0])} per USD)")
+    # The prices are accrued usage to date, not a flat monthly rate, so a longer
+    # campaign is already paid for in the denominator and the ratio does not
+    # reward one.  What the hours do show is the rate each host was charged at.
+    rate = {p: cost_usd(p) / work.total(p)["hours"]
+            for p in work.providers
+            if cost_usd(p) and work.total(p)["hours"] > 0}
+    if rate:
+        cheap = min(rate, key=lambda p: rate[p])
+        dear = max(rate, key=lambda p: rate[p])
+        print(f"  spend is usage accrued to date, hours included, so the rate "
+              f"is what differs: {rate[cheap]:.2f} USD per host-hour at "
+              f"{pretty(cheap)} to {rate[dear]:.2f} at {pretty(dear)}")
+    for rec in work.skipped:
+        print(f"  skipped {rec['name']}: {rec['why']}")
 
 
-def write_cost_table(aggs: dict, out: Path) -> Path:
-    """Work done, price and work-per-USD, one row per provider/data-set size
-    plus an all-sizes row.  The peak rate stays in as context for the sum."""
+def write_cost_table(work: HostWork, out: Path) -> Path:
+    """Transactions, price and transactions-per-USD: one row per session, plus
+    the whole-campaign row each provider is actually billed for."""
     with out.open("w", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(["benchmark", "provider", "dataset", "dataset_label",
-                    "measurements", "total_transactions", "total_new_orders",
-                    "peak_metric", "peak", "at_concurrency",
+        w.writerow(["provider", "scope", "session", "started_utc", "benchmarks",
+                    "host_hours", "measured_runs", "transactions",
+                    "transactions_in_runs", "transactions_builds_and_idle",
+                    "queries", "insert_statements", "innodb_rows_inserted",
                     "cost_as_billed", "currency", "usd_per_unit", "cost_usd",
-                    "transactions_per_usd", "new_orders_per_usd"])
-        for bench, agg in aggs.items():
-            unit = BENCH_SPEC[bench]["metric"].split()[0]
-            for provider in agg.providers:
-                native, usd = cost_native(provider), cost_usd(provider)
-                for dataset in list(agg.datasets) + [None]:
-                    txn, nord, count = agg.total(provider, dataset)
-                    if not txn:
-                        continue
-                    peak, at = (agg.peak(provider, dataset) if dataset is not None
-                                else (None, None))
-                    w.writerow([
-                        bench, provider,
-                        "" if dataset is None else dataset,
-                        "all sizes" if dataset is None else label_dataset(bench, dataset),
-                        count, f"{txn:.0f}", f"{nord:.0f}",
-                        unit, "" if peak is None else f"{peak:.2f}",
-                        "" if at is None else at,
-                        "" if native is None else f"{native[0]:.2f}",
-                        "" if native is None else native[1],
-                        "" if native is None else f"{FX_USD_PER[native[1]]:.6f}",
-                        "" if usd is None else f"{usd:.2f}",
-                        "" if usd is None else f"{txn / usd:.1f}",
-                        "" if usd is None else f"{nord / usd:.1f}",
-                    ])
+                    "transactions_per_usd"])
+
+        def row(provider: str, scope: str, rec: dict, session: str, stamp: str):
+            native, usd = cost_native(provider), cost_usd(provider)
+            # Per-session rows carry the price only on the campaign row: the
+            # instance is billed once, not once per session.
+            billed = scope == "campaign"
+            w.writerow([
+                provider, scope, session, stamp, " + ".join(rec["benches"]),
+                f"{rec['hours']:.2f}", rec["runs"], rec["txn"], rec["in_run"],
+                rec["setup"], rec["queries"], rec["inserts"], rec["rows"],
+                "" if not billed or native is None else f"{native[0]:.2f}",
+                "" if not billed or native is None else native[1],
+                "" if not billed or native is None else f"{FX_USD_PER[native[1]]:.6f}",
+                "" if not billed or usd is None else f"{usd:.2f}",
+                "" if not billed or usd is None else f"{rec['txn'] / usd:.1f}",
+            ])
+
+        for provider in work.providers:
+            for rec in work.of(provider):
+                row(provider, "session", rec, rec["name"], rec["stamp"])
+            row(provider, "campaign", work.total(provider), "", "")
     return out
 
 
@@ -660,6 +869,24 @@ def report(agg: Agg, metric: str, conc_label: str) -> None:
         print(line)
 
 
+def report_latency(agg: Agg, metric: str, conc_short: str) -> None:
+    """p95 under the heaviest load each provider reached - the level is printed
+    with it, because not every provider finished the sweep."""
+    print(f"\n{agg.bench}: {metric} at the top of the sweep "
+          f"(mean over runs; @ is the {conc_short} level)")
+    print("  " + f"{'provider':<14}" + "".join(
+        f"{label_dataset(agg.bench, d):>24}" for d in agg.datasets))
+    for provider in agg.providers:
+        line = "  " + f"{pretty(provider):<14}"
+        for dataset in agg.datasets:
+            value, at = agg.at_top(provider, dataset)
+            line += f"{(f'{value:,.1f} ms @ {at}' if value else 'no data'):>24}"
+        print(line)
+    if agg.missing:
+        print(f"  {agg.missing} measurement(s) had no p95 and are not in the "
+              f"latency charts")
+
+
 # ----------------------------------------------------------------- main ------
 BENCH_SPEC = {
     "sysbench": dict(
@@ -669,9 +896,15 @@ BENCH_SPEC = {
         sub="Managed MySQL, 10 tables; mean of the measured 20 min window across runs, band = min-max",
         peak_title="sysbench oltp_read_write - peak throughput",
         peak_sub="Best thread level per provider, at the data-set size named below",
-        eff_title="sysbench oltp_read_write - cost efficiency",
-        eff_sub="Transactions completed across all runs per USD of instance spend",
         table="summary_sysbench_tps.csv",
+        # Latency spans two orders of magnitude across providers, so the axis is
+        # logarithmic; on a linear one the fast five collapse into the baseline.
+        p95_metric="p95 latency (ms, log scale) - lower is better",
+        p95_title="sysbench oltp_read_write - 95th percentile latency",
+        p95_sub="sysbench's own p95 over the measured 20 min window; mean across runs, band = min-max",
+        p95_note="sysbench reports a fresh statistics block after the ramp-up, so this "
+                 "percentile covers the measured window only - the same window as the TPS above.",
+        p95_table="summary_sysbench_p95_ms.csv",
     ),
     "hammerdb": dict(
         metric="NOPM (new orders/min)", conc_label="Virtual users", conc_short="vu",
@@ -680,11 +913,26 @@ BENCH_SPEC = {
         sub="Managed MySQL; mean of the measured 20 min window across runs, band = min-max",
         peak_title="HammerDB TPC-C - peak throughput",
         peak_sub="Best virtual-user level per provider, at the warehouse count named below",
-        eff_title="HammerDB TPC-C - cost efficiency",
-        eff_sub="TPC-C transactions across all runs per USD of instance spend",
         table="summary_hammerdb_nopm.csv",
+        p95_metric="New-Order p95 latency (ms, log scale) - lower is better",
+        p95_title="HammerDB TPC-C - 95th percentile New-Order latency",
+        # HammerDB's time profile is never reset between ramp-up and the measured
+        # window, so unlike NOPM this percentile includes the ramp-up.
+        p95_sub="HammerDB xtprof p95 merged across virtual users, ramp-up included; "
+                "mean across runs, band = min-max",
+        p95_note="HammerDB's time profile is never reset, so unlike the NOPM above this "
+                 "percentile includes the 5 min ramp-up - it reads a little better than a "
+                 "window-only figure would, and is not directly comparable with sysbench's.",
+        p95_table="summary_hammerdb_p95_ms.csv",
     ),
 }
+
+# Cost efficiency spans the benchmarks rather than sitting inside one, so its
+# copy lives next to them rather than in either spec.
+COST_SPEC = dict(
+    title="Managed MySQL - cost efficiency",
+    sub="Transactions committed on the database host per USD billed for running it",
+)
 
 
 def main(argv=None) -> int:
@@ -722,12 +970,18 @@ def main(argv=None) -> int:
         print(f"  {s.bench:<9} {pretty(s.provider):<14} {s.stamp}  "
               f"{len(s.rows):>3} measurements{note}")
 
+    # Read straight off the results tree, not off the sessions: a directory can
+    # hold both benchmarks, and the host is billed once either way.
+    work = HostWork(args.results)
+
     report_costs(sorted({s.provider for s in sessions}))
+    report_host_efficiency(work)
 
     args.outdir.mkdir(parents=True, exist_ok=True)
     modes = ("light", "dark") if args.theme == "both" else (args.theme,)
     written: list[Path] = []
     aggs: dict[str, Agg] = {}
+    lats: dict[str, Agg] = {}
 
     for bench, spec in BENCH_SPEC.items():
         group = [s for s in sessions if s.bench == bench and s.rows]
@@ -743,10 +997,19 @@ def main(argv=None) -> int:
 
         aggs[bench] = agg
         report(agg, spec["metric"], spec["conc_label"])
-        report_efficiency(agg, spec["metric"])
         written.append(write_table(agg, args.outdir / spec["table"],
                                    spec["dataset_col"], spec["conc_col"],
                                    spec["metric"].split()[0].lower()))
+
+        # Throughput says how much work got through; p95 says what it cost the
+        # slowest 5% of statements.  Same sweep, same providers, own axis.
+        lat = Agg(bench, group, field="p95")
+        lat.providers = [p for p in agg.providers if p in lat.providers]
+        lats[bench] = lat
+        if lat.providers:
+            report_latency(lat, spec["p95_metric"].split(" (")[0], spec["conc_short"])
+            written.append(write_table(lat, args.outdir / spec["p95_table"],
+                                       spec["dataset_col"], spec["conc_col"], "p95_ms"))
         if not args.images:
             continue
         # One graph per file: every image holds a single plot for a single
@@ -768,19 +1031,30 @@ def main(argv=None) -> int:
                     args.outdir / f"{bench}-peak-{metric_slug}-{ds}{suffix}.{args.format}",
                     spec["metric"], spec["conc_short"], spec["peak_title"],
                     spec["peak_sub"], dataset))
-                written.append(chart_peak(
-                    agg, mode,
-                    args.outdir / f"{bench}-cost-efficiency-{ds}{suffix}.{args.format}",
-                    spec["metric"], spec["conc_short"], spec["eff_title"],
-                    spec["eff_sub"], dataset, per_usd=True))
+                if dataset in lat.datasets:
+                    written.append(chart_scaling(
+                        lat, mode,
+                        args.outdir / f"{bench}-p95-vs-{spec['conc_col']}"
+                                      f"-{ds}{suffix}.{args.format}",
+                        spec["p95_metric"], spec["conc_label"], spec["p95_title"],
+                        spec["p95_sub"], dataset, logy=True))
 
-    if aggs:
-        written.append(write_cost_table(aggs, args.outdir / "summary_cost_efficiency.csv"))
+    # One chart, not one per benchmark: the instance is billed once for
+    # everything that ran on it.
+    if work.providers:
+        written.append(write_cost_table(work, args.outdir / "summary_cost_efficiency.csv"))
+        if args.images:
+            for mode in modes:
+                suffix = "" if args.theme != "both" else f"-{mode}"
+                written.append(chart_cost(
+                    work, mode,
+                    args.outdir / f"cost-efficiency{suffix}.{args.format}",
+                    COST_SPEC["title"], COST_SPEC["sub"]))
 
     if args.html and aggs:
         payload = html_report.build_payload(
-            aggs, sessions, args.results.resolve(), BENCH_SPEC, pretty, label_dataset,
-            cost_usd, cost_native,
+            aggs, lats, sessions, work, args.results.resolve(), BENCH_SPEC,
+            COST_SPEC, pretty, label_dataset, cost_usd, cost_native,
             {"asof": FX_ASOF, "source": FX_SOURCE, "usdPer": FX_USD_PER})
         written.append(html_report.write(payload, args.outdir / args.html))
 
