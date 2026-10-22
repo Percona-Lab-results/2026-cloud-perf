@@ -45,7 +45,10 @@ HDB_DB="tpcc"
 HDB_WAREHOUSE_LIST="160 320 640"   # one data set per value
 HDB_BUILD_VU=16
 HDB_ALLWAREHOUSE="true"
-HDB_STORED_PROCS="false"     # PostgreSQL TPROC-C runs client-side SQL by default
+# One server round trip per transaction instead of one per statement, which is
+# what HammerDB's own reference scripts use and what the MySQL harness does
+# (mysql_no_stored_procs=false). Only pg_storedprocs's XML default is false.
+HDB_STORED_PROCS="true"
 TPCC_USER=""                 # defaults to --user, so no role has to be created
 TPCC_PASS=""
 
@@ -105,8 +108,10 @@ HammerDB:
                                (default "$HDB_WAREHOUSE_LIST")
       --build-vu N             virtual users used to build the schema (default $HDB_BUILD_VU)
       --no-allwarehouse        each VU stays on its home warehouse
-      --stored-procs yes|no    build the TPC-C schema with stored procedures
-                               (default no - the driver issues plain SQL)
+      --stored-procs yes|no    build and drive the TPC-C schema with stored
+                               procedures (default yes - 'no' makes the driver
+                               issue each statement from the client, which
+                               costs a round trip per statement)
       --tpcc-user USER         owner of the TPC-C schema (default: --user, which
                                avoids needing CREATEROLE on a managed service)
       --tpcc-password PASS     password of --tpcc-user (default: --password)
