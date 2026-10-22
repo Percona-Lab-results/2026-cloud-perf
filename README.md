@@ -1,6 +1,12 @@
 # 2026-cloud-perf
 Performance research of standard managed DB tiers in minor cloud providers
 
+Two drivers, same matrix, same output layout, so MySQL and PostgreSQL tiers of
+the same provider are directly comparable:
+
+* [cloud-mysql-perf.sh](cloud-mysql-perf.sh) - managed MySQL
+* [cloud-pg-perf.sh](cloud-pg-perf.sh) - managed PostgreSQL
+
 ## cloud-mysql-perf.sh
 
 OLTP benchmark driver for a managed MySQL endpoint. Sweeps the thread matrix
@@ -125,3 +131,61 @@ awk 'FNR>1 || NR==1' results/*/*_sysbench_results.csv > all_sysbench.csv
   dropped, so the 25 minutes are one continuous run.
 * Run the client close to the database (same region) - otherwise round-trip
   time, not the database tier, is what gets measured.
+
+## cloud-pg-perf.sh
+
+The PostgreSQL counterpart: same benchmarks (`sysbench oltp_read_write` through
+sysbench's `pgsql` driver, HammerDB TPROC-C with `dbset db pg`), same data sets,
+thread levels, ramp-up/duration, `--rebuild` semantics, provider prefixing and
+CSV columns, so the two scripts' results can be compared column by column.
+
+```bash
+./cloud-pg-perf.sh --provider digitalocean \
+    -H db.example.com -P 25060 -u doadmin -p 'secret' \
+    --maintenance-db defaultdb --ssl --label 2vcpu-4gb
+
+./cloud-pg-perf.sh --provider linode -H db.example.com -u admin \
+    --password-file ~/.pw --runs 1 -t "1 8" -b sysbench \
+    --table-size 10M --rebuild dataset
+./cloud-pg-perf.sh --help
+```
+
+Requirements: `postgresql-client` (for `psql`) and a sysbench built with the
+`pgsql` driver - the Ubuntu package is, and `sysbench --help` lists the
+compiled-in drivers. HammerDB 6.0 ships its PostgreSQL library inside the
+binary, so no extra Tcl package is needed.
+
+What differs from the MySQL script:
+
+| | MySQL | PostgreSQL |
+|---|---|---|
+| credentials | 0600 `--defaults-extra-file` | 0600 `PGPASSFILE` + `PG*` env vars |
+| TLS | `--ssl` | `--ssl` (`sslmode=require`), `--ssl-ca FILE` (`verify-ca`) |
+| admin connection | any schema | `--maintenance-db` (default `postgres`, DO uses `defaultdb`) |
+| settings | `SHOW GLOBAL VARIABLES` | `pg_settings` |
+| counters | `SHOW GLOBAL STATUS` | `pg_stat_database`/`_bgwriter`/`_wal`/`_checkpointer`/`_io`, melted to name/value pairs |
+| deep dive | `--innodb-status` | `--detail-stats` (`pg_stat_activity`, `pg_locks`, `pg_stat_user_tables`) |
+| stored procedures | `--no-stored-procs` (default no) | `--stored-procs yes\|no` (default no) |
+| after a load | - | `VACUUM ANALYZE` (and HammerDB `pg_vacuum`), off with `--no-vacuum` |
+
+Extra notes:
+
+* The benchmark user needs `CREATEDB`; the rebuild uses
+  `DROP DATABASE ... WITH (FORCE)` and falls back to terminating the backends,
+  then to `sysbench cleanup` / HammerDB `deleteschema`. The preflight warns when
+  `CREATEDB` is missing.
+* A fresh load has no visibility map and no statistics, so `VACUUM ANALYZE`
+  after loading is on by default - without it the first run of a data set
+  measures different plans and hint-bit writes rather than the tier.
+* Counter views come and went across versions (`pg_stat_wal` 14,
+  `pg_stat_io` 16, `pg_stat_checkpointer` 17). The preflight drops the ones this
+  server lacks and says so; everything else is collected as name/value pairs, so
+  column churn does not break the deltas.
+* `--tpcc-user` defaults to the connection user, so no role has to be created on
+  a managed service; HammerDB creates the `tpcc` database itself.
+* The `errors` column of the sysbench CSV counts ignored errors, which on
+  PostgreSQL are mostly serialization/deadlock retries. They are common on small
+  data sets with several threads and should be near zero at 10M+ rows - if not,
+  the number belongs in the write-up.
+* `pg_stat_ssl` is logged at preflight, so the results record whether the run
+  was actually encrypted.
